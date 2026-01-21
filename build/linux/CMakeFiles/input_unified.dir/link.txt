@@ -1,0 +1,1 @@
+/usr/bin/cc -O3 -DNDEBUG CMakeFiles/input_unified.dir/src/input_unified.c.o -o input_unified  /usr/lib/x86_64-linux-gnu/libssl.so /usr/lib/x86_64-linux-gnu/libcrypto.so -lwebsockets -lcap -lm -lX11 -lXtst -lXrandr -lXfixes 

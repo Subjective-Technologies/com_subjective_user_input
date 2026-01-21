@@ -1,0 +1,124 @@
+2026-01-21 20:12:15 - INFO - Logging to: logs/input_unified_goldenthinker_20260121201215.log
+2026-01-21 20:12:15 - INFO - Computer: goldenthinker
+2026-01-21 20:12:15 - INFO - Detected monitor m0: 1920x1080 at (0,0)
+2026-01-21 20:12:15 - INFO - XTest extension version 2.2
+2026-01-21 20:12:15 - INFO - Using system Python: python3
+2026-01-21 20:12:16 - INFO - Started server process (PID: 3358785)
+2026-01-21 20:12:16 - INFO - Server logs: /home/golden/Desktop/brainboost_tools/subjective_user_input_c/logs/input_server_goldenthinker_20260121201216.log
+2026-01-21 20:12:18 - INFO - === Unified Input Client v1.0.0 ===
+2026-01-21 20:12:18 - INFO - Platform: Linux
+2026-01-21 20:12:18 - INFO - Computer ID: goldenthinker
+2026-01-21 20:12:18 - INFO - Role: main
+2026-01-21 20:12:18 - INFO - Server: ws://127.0.0.1:8765
+2026-01-21 20:12:18 - INFO - Monitors: 1
+2026-01-21 20:12:18 - INFO - No evdev devices (run as root or add to 'input' group for better performance)
+2026-01-21 20:12:18 - INFO - Using X11 input capture fallback mode
+2026-01-21 20:12:18 - INFO - Connecting to ws://127.0.0.1:8765/
+2026-01-21 20:12:18 - INFO - Waiting up to 20 seconds for WebSocket connection...
+2026-01-21 20:12:18 - INFO - WebSocket connected
+2026-01-21 20:12:18 - INFO - Sent registration: goldenthinker as main (has keyboard/mouse)
+2026-01-21 20:12:18 - INFO - Starting X11 input capture (fallback mode)
+2026-01-21 20:12:18 - INFO - 📋 Clipboard monitor started
+2026-01-21 20:12:18 - INFO - XRecord extension version 1.13
+2026-01-21 20:12:18 - INFO - Registration confirmed: success
+2026-01-21 20:12:18 - INFO - Active monitor changed to goldenthinker:m0
+2026-01-21 20:12:18 - INFO - Set cursor to (960, 540)
+2026-01-21 20:12:18 - INFO - This computer is now ACTIVE - local input enabled
+
+
+╔═══════════════════════════════════════════════════════════════╗
+║              DYNAMIC MONITOR LAYOUT                           ║
+╚═══════════════════════════════════════════════════════════════╝
+
+                      
+ ███████████████████  
+ █                 █  
+ █                 █  
+ █                 █  
+ █                 █  
+ █    goldenth     █  
+ █    1920x1080    █  
+ █                 █  
+ █                 █  
+ ███████████████████  
+                      
+                      
+
+Legend:
+  █ = Main computer (has physical keyboard/mouse)
+  ▓ = Player computer (receives input remotely)
+
+Connected: 1 computer(s)
+Main: goldenthinker
+Order: goldenthinker
+Links: 0 edge connection(s)
+
+
+2026-01-21 20:12:18 - INFO - ⌨️ XRecord context created (keyboard capture ready)
+2026-01-21 20:12:18 - INFO - X11 input capture thread started (XQueryPointer polling, ~60Hz send rate, XRecord keyboard)
+2026-01-21 20:12:18 - INFO - Initial mouse position: (960, 540)
+2026-01-21 20:12:18 - INFO - ⌨️ XRecord thread started
+2026-01-21 20:12:18 - INFO - 📋 Initial clipboard: 35 chars
+2026-01-21 20:12:18 - INFO - 📤 send_input_event perf: count=1, avg=0.013ms
+2026-01-21 20:12:18 - INFO - X11 mouse_move #1: (1079,548), queue=0
+2026-01-21 20:12:18 - INFO - 📤 WS SENT: 1 msgs (total=1), queue was 1 now 0
+2026-01-21 20:12:18 - INFO - 📥 Received mouse_move (count=1), active=goldenthinker, for_me=1
+2026-01-21 20:12:18 - INFO - X11 mouse_move #2: (1096,548), queue=0
+2026-01-21 20:12:18 - INFO - 📤 WS SENT: 1 msgs (total=2), queue was 1 now 0
+2026-01-21 20:12:18 - INFO - X11 mouse_move #3: (1111,548), queue=0
+2026-01-21 20:12:18 - INFO - 📤 WS SENT: 1 msgs (total=3), queue was 1 now 0
+2026-01-21 20:12:18 - INFO - X11 mouse_move #4: (1137,549), queue=0
+2026-01-21 20:12:18 - INFO - 📤 WS SENT: 1 msgs (total=4), queue was 1 now 0
+2026-01-21 20:12:18 - INFO - X11 mouse_move #5: (1154,549), queue=0
+2026-01-21 20:12:18 - INFO - 📤 WS SENT: 1 msgs (total=5), queue was 1 now 0
+2026-01-21 20:12:18 - INFO - 📤 WS SENT: 1 msgs (total=6), queue was 1 now 0
+2026-01-21 20:12:18 - INFO - 📤 WS SENT: 1 msgs (total=7), queue was 1 now 0
+2026-01-21 20:12:18 - INFO - 📤 WS SENT: 1 msgs (total=8), queue was 1 now 0
+2026-01-21 20:12:18 - INFO - 📤 WS SENT: 1 msgs (total=9), queue was 1 now 0
+2026-01-21 20:12:18 - INFO - 📤 WS SENT: 1 msgs (total=10), queue was 1 now 0
+2026-01-21 20:12:23 - INFO - X11 poll stats: polls=1250, moves=64, pos=(1190,787), connected=1, executing=0, queue=0
+2026-01-21 20:12:24 - INFO - 🖱️ CLICK: left press at (1190,786), queue=1
+2026-01-21 20:12:24 - INFO - 📥 Received mouse_click event, active=goldenthinker, for_me=1
+2026-01-21 20:12:24 - INFO - 🖱️ CLICK: left release at (1183,304), queue=1
+2026-01-21 20:12:24 - INFO - 📥 Received mouse_click event, active=goldenthinker, for_me=1
+2026-01-21 20:12:25 - INFO - 🖱️ SCROLL: up at (1084,823) [#1]
+2026-01-21 20:12:25 - INFO - 📥 Received mouse_scroll event, active=goldenthinker, for_me=1
+2026-01-21 20:12:25 - INFO - 🖱️ SCROLL: up at (1084,823) [#2]
+2026-01-21 20:12:25 - INFO - 📥 Received mouse_scroll event, active=goldenthinker, for_me=1
+2026-01-21 20:12:25 - INFO - 🖱️ SCROLL: up at (1084,823) [#3]
+2026-01-21 20:12:25 - INFO - 📥 Received mouse_scroll event, active=goldenthinker, for_me=1
+2026-01-21 20:12:25 - INFO - 📥 Received mouse_scroll event, active=goldenthinker, for_me=1
+2026-01-21 20:12:25 - INFO - 📥 Received mouse_scroll event, active=goldenthinker, for_me=1
+2026-01-21 20:12:25 - INFO - 📥 Received mouse_scroll event, active=goldenthinker, for_me=1
+2026-01-21 20:12:25 - INFO - 📥 Received mouse_scroll event, active=goldenthinker, for_me=1
+2026-01-21 20:12:25 - INFO - 📥 Received mouse_scroll event, active=goldenthinker, for_me=1
+2026-01-21 20:12:28 - INFO - X11 poll stats: polls=2500, moves=89, pos=(1084,823), connected=1, executing=0, queue=0
+2026-01-21 20:12:34 - INFO - X11 poll stats: polls=3750, moves=89, pos=(1084,823), connected=1, executing=0, queue=0
+2026-01-21 20:12:40 - INFO - X11 poll stats: polls=5000, moves=89, pos=(1084,823), connected=1, executing=0, queue=0
+2026-01-21 20:12:42 - INFO - 📤 send_input_event perf: count=89, avg=0.014ms
+2026-01-21 20:12:44 - INFO - 🖱️ CLICK: left press at (1583,734), queue=1
+2026-01-21 20:12:45 - INFO - 🖱️ CLICK: left release at (1567,1034), queue=1
+2026-01-21 20:12:45 - INFO - X11 poll stats: polls=6250, moves=191, pos=(1201,631), connected=1, executing=0, queue=0
+2026-01-21 20:12:59 - INFO - ⌨️ KEY: press Key.cmd [#1]
+2026-01-21 20:12:59 - INFO - ⌨️ KEY: release Key.cmd [#2]
+2026-01-21 20:13:00 - INFO - ⌨️ KEY: press Key.cmd [#3]
+2026-01-21 20:13:00 - INFO - ⌨️ KEY: release Key.cmd [#4]
+2026-01-21 20:13:07 - INFO - 📤 send_input_event perf: count=102, avg=0.014ms
+2026-01-21 20:13:07 - INFO - X11 mouse_move #200: (1244,1079), queue=0 [EDGE]
+2026-01-21 20:13:11 - INFO - 🖱️ CLICK: left press at (405,991), queue=1
+2026-01-21 20:13:11 - INFO - 🖱️ CLICK: left release at (405,991), queue=1
+2026-01-21 20:13:17 - INFO - ⌨️ KEY: press b [#5]
+2026-01-21 20:13:18 - INFO - 💓 Heartbeat: running, connected=1, queue=0
+2026-01-21 20:13:19 - INFO - 📥 Received keyboard event, active=goldenthinker, for_me=1
+2026-01-21 20:13:21 - INFO - ⌨️ KEY: release   [#50]
+2026-01-21 20:13:24 - INFO - 📤 send_input_event perf: count=115, avg=0.008ms
+2026-01-21 20:13:24 - INFO - 🖱️ CLICK: left press at (1133,871), queue=1
+2026-01-21 20:13:25 - INFO - 🖱️ CLICK: left release at (1133,871), queue=1
+2026-01-21 20:13:25 - INFO - Signal 2 received, shutting down...
+2026-01-21 20:13:25 - INFO - Stopping server process (PID: 3358785)...
+2026-01-21 20:13:25 - INFO - ⌨️ XRecord thread exiting
+2026-01-21 20:13:25 - INFO - X11 input capture thread stopped (polls: 15376, moves: 345, query_fails: 0)
+2026-01-21 20:13:26 - INFO - 📋 Clipboard monitor stopped
+2026-01-21 20:13:26 - INFO - WebSocket closed by server
+2026-01-21 20:13:26 - INFO - Server connection lost. Exiting gracefully...
+2026-01-21 20:13:26 - INFO - Client stopped

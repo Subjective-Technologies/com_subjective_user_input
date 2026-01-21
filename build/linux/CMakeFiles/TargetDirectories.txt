@@ -1,0 +1,3 @@
+/brainboost/brainboost_tools/subjective_user_input_c/build/linux/CMakeFiles/input_unified.dir
+/brainboost/brainboost_tools/subjective_user_input_c/build/linux/CMakeFiles/edit_cache.dir
+/brainboost/brainboost_tools/subjective_user_input_c/build/linux/CMakeFiles/rebuild_cache.dir
