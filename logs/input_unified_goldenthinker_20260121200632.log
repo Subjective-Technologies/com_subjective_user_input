@@ -1,6 +1,0 @@
-2026-01-21 20:06:32 - INFO - Logging to: logs/input_unified_goldenthinker_20260121200632.log
-2026-01-21 20:06:32 - INFO - Computer: goldenthinker
-2026-01-21 20:06:32 - INFO - Detected monitor m0: 1920x1080 at (0,0)
-2026-01-21 20:06:32 - INFO - XTest extension version 2.2
-2026-01-21 20:06:32 - ERROR - Server script not found: /home/golden/Desktop/brainboost_tools/subjective_user_input_c/input_server.py
-2026-01-21 20:06:32 - ERROR - Failed to start local server
