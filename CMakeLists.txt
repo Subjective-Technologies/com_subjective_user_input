@@ -15,6 +15,10 @@ if(WIN32)
     target_compile_definitions(input_unified PRIVATE WIN32)
 endif()
 
+if(MSVC)
+    target_compile_definitions(input_unified PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
 # Platform output folder
 if(WIN32)
     set(PLATFORM_DIR "windows")
@@ -47,7 +51,7 @@ if(LWS_FOUND)
     target_compile_options(input_unified PRIVATE ${LWS_CFLAGS_OTHER})
 else()
     find_package(libwebsockets CONFIG REQUIRED)
-    target_link_libraries(input_unified PRIVATE libwebsockets::websockets)
+    target_link_libraries(input_unified PRIVATE websockets_shared)
 endif()
 
 if(UNIX AND NOT APPLE)

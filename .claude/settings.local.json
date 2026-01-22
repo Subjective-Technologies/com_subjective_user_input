@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./scripts/build_windows_msvc.ps1)",
+      "Bash(powershell -ExecutionPolicy Bypass -File scripts/build_windows_msvc.ps1)",
+      "Bash(./build/windows/input_unified.exe:*)"
+    ]
+  }
+}

@@ -97,6 +97,7 @@
     #include <ws2tcpip.h>
     #include <process.h>
     #include <io.h>
+    #include <direct.h>
     #include <pthread.h>  /* pthreads4w from vcpkg */
     #pragma comment(lib, "ws2_32.lib")
     #pragma comment(lib, "user32.lib")
@@ -277,6 +278,52 @@ typedef struct {
     
 } ClientState;
 
+/* ============================================================================
+ * Embedded Server State (for --role main server mode)
+ * ============================================================================ */
+
+#define MAX_SERVER_CLIENTS 16
+
+/* Per-client session data for server mode */
+typedef struct {
+    char computer_id[MAX_HOSTNAME];
+    char role[16];  /* "main" or "player" */
+    Monitor monitors[MAX_MONITORS];
+    int monitor_count;
+    bool registered;
+    struct lws *wsi;
+    /* Receive buffer */
+    char rx_buffer[MAX_MESSAGE_SIZE];
+    size_t rx_len;
+} ServerClient;
+
+/* Server state */
+typedef struct {
+    bool running;
+    bool is_server_mode;  /* true if running as embedded server */
+    int port;
+    struct lws_context *ws_context;
+
+    /* Connected clients */
+    ServerClient clients[MAX_SERVER_CLIENTS];
+    int client_count;
+    pthread_mutex_t clients_mutex;
+
+    /* Active computer tracking */
+    char active_computer_id[MAX_HOSTNAME];
+    char active_monitor_id[32];
+    double cursor_x;
+    double cursor_y;
+
+    /* Edge crossing debounce */
+    double last_edge_crossing_time;
+    char last_crossed_from_computer[MAX_HOSTNAME];
+    char last_crossed_from_monitor[32];
+} ServerState;
+
+/* Global server state */
+static ServerState g_server = {0};
+
 /* Global client state (needed for callbacks) */
 static ClientState g_client;
 static volatile sig_atomic_t g_shutdown = 0;
@@ -354,11 +401,19 @@ static int init_logging(const char *computer_name) {
                 log_dir[sizeof(log_dir) - 1] = '\0';  /* Ensure null termination */
             } else {
                 /* Create logs directory */
+#ifdef PLATFORM_WINDOWS
+                _mkdir(log_dir);
+#else
                 mkdir(log_dir, 0755);
+#endif
             }
         } else {
             /* Environment variable path specified, create it if it doesn't exist */
+#ifdef PLATFORM_WINDOWS
+            _mkdir(log_dir);
+#else
             mkdir(log_dir, 0755);
+#endif
         }
     }
     
@@ -1689,6 +1744,7 @@ static bool clipboard_set(const char *content, size_t len) {
 /* Forward declaration */
 static void send_input_event(ClientState *client, const char *event_type, 
                              const char *json_data);
+static void* clipboard_monitor_thread(void *arg);
 
 /* Clipboard monitor thread */
 static void* clipboard_monitor_thread(void *arg) {
@@ -2884,6 +2940,468 @@ static int ws_callback(struct lws *wsi, enum lws_callback_reasons reason,
     return 0;
 }
 
+/* ============================================================================
+ * Embedded WebSocket Server (for --role main without external server)
+ * ============================================================================ */
+
+/* Find a client slot by WSI */
+static ServerClient* server_find_client_by_wsi(struct lws *wsi) {
+    for (int i = 0; i < MAX_SERVER_CLIENTS; i++) {
+        if (g_server.clients[i].wsi == wsi) {
+            return &g_server.clients[i];
+        }
+    }
+    return NULL;
+}
+
+/* Find a client by computer_id */
+static ServerClient* server_find_client_by_id(const char *computer_id) {
+    for (int i = 0; i < MAX_SERVER_CLIENTS; i++) {
+        if (g_server.clients[i].registered &&
+            strcmp(g_server.clients[i].computer_id, computer_id) == 0) {
+            return &g_server.clients[i];
+        }
+    }
+    return NULL;
+}
+
+/* Allocate a new client slot */
+static ServerClient* server_allocate_client(struct lws *wsi) {
+    for (int i = 0; i < MAX_SERVER_CLIENTS; i++) {
+        if (g_server.clients[i].wsi == NULL) {
+            memset(&g_server.clients[i], 0, sizeof(ServerClient));
+            g_server.clients[i].wsi = wsi;
+            g_server.client_count++;
+            return &g_server.clients[i];
+        }
+    }
+    return NULL;
+}
+
+/* Free a client slot */
+static void server_free_client(ServerClient *client) {
+    if (client) {
+        memset(client, 0, sizeof(ServerClient));
+        g_server.client_count--;
+    }
+}
+
+/* Send message to a specific client */
+static void server_send_to_client(ServerClient *client, const char *msg) {
+    if (!client || !client->wsi) return;
+
+    size_t len = strlen(msg);
+    unsigned char *buf = malloc(LWS_PRE + len + 1);
+    if (!buf) return;
+
+    memcpy(buf + LWS_PRE, msg, len);
+    lws_write(client->wsi, buf + LWS_PRE, len, LWS_WRITE_TEXT);
+    free(buf);
+}
+
+/* Broadcast message to all registered clients */
+static void server_broadcast(const char *msg) {
+    for (int i = 0; i < MAX_SERVER_CLIENTS; i++) {
+        if (g_server.clients[i].registered && g_server.clients[i].wsi) {
+            server_send_to_client(&g_server.clients[i], msg);
+        }
+    }
+}
+
+/* Broadcast message to all clients except one */
+static void server_broadcast_except(const char *msg, const char *except_computer_id) {
+    for (int i = 0; i < MAX_SERVER_CLIENTS; i++) {
+        if (g_server.clients[i].registered && g_server.clients[i].wsi) {
+            if (strcmp(g_server.clients[i].computer_id, except_computer_id) != 0) {
+                server_send_to_client(&g_server.clients[i], msg);
+            }
+        }
+    }
+}
+
+/* Handle registration message from client */
+static void server_handle_registration(ServerClient *client, const char *json_data) {
+    /* Parse computer_id */
+    const char *id_start = strstr(json_data, "\"computer_id\"");
+    if (id_start) {
+        id_start = strchr(id_start + 13, '"');
+        if (id_start) {
+            id_start++;
+            const char *id_end = strchr(id_start, '"');
+            if (id_end) {
+                size_t len = id_end - id_start;
+                if (len < MAX_HOSTNAME) {
+                    strncpy(client->computer_id, id_start, len);
+                    client->computer_id[len] = '\0';
+                }
+            }
+        }
+    }
+
+    /* Parse role (is_main) */
+    if (strstr(json_data, "\"is_main\":true") || strstr(json_data, "\"is_main\": true")) {
+        strcpy(client->role, "main");
+    } else if (strstr(json_data, "\"role\":\"main\"") || strstr(json_data, "\"role\": \"main\"")) {
+        strcpy(client->role, "main");
+    } else {
+        strcpy(client->role, "player");
+    }
+
+    /* Parse monitors */
+    const char *monitors_start = strstr(json_data, "\"monitors\"");
+    if (monitors_start) {
+        monitors_start = strchr(monitors_start, '[');
+        if (monitors_start) {
+            client->monitor_count = 0;
+            const char *mon_ptr = monitors_start;
+            while ((mon_ptr = strstr(mon_ptr, "\"monitor_id\"")) && client->monitor_count < MAX_MONITORS) {
+                Monitor *mon = &client->monitors[client->monitor_count];
+
+                /* Parse monitor_id */
+                const char *mid_start = strchr(mon_ptr + 12, '"');
+                if (mid_start) {
+                    mid_start++;
+                    const char *mid_end = strchr(mid_start, '"');
+                    if (mid_end) {
+                        size_t len = mid_end - mid_start;
+                        if (len < sizeof(mon->monitor_id)) {
+                            strncpy(mon->monitor_id, mid_start, len);
+                            mon->monitor_id[len] = '\0';
+                        }
+                    }
+                }
+
+                /* Parse width */
+                const char *w_start = strstr(mon_ptr, "\"width\"");
+                if (w_start) {
+                    w_start = strchr(w_start + 7, ':');
+                    if (w_start) mon->width = atoi(w_start + 1);
+                }
+
+                /* Parse height */
+                const char *h_start = strstr(mon_ptr, "\"height\"");
+                if (h_start) {
+                    h_start = strchr(h_start + 8, ':');
+                    if (h_start) mon->height = atoi(h_start + 1);
+                }
+
+                mon->x = 0;
+                mon->y = 0;
+                client->monitor_count++;
+                mon_ptr = mid_start ? mid_start : mon_ptr + 1;
+            }
+        }
+    }
+
+    client->registered = true;
+
+    /* If this is the first main client or first client overall, set as active */
+    if (g_server.active_computer_id[0] == '\0' || strcmp(client->role, "main") == 0) {
+        strncpy(g_server.active_computer_id, client->computer_id, MAX_HOSTNAME - 1);
+        strcpy(g_server.active_monitor_id, client->monitor_count > 0 ? client->monitors[0].monitor_id : "m0");
+        g_server.cursor_x = client->monitor_count > 0 ? client->monitors[0].width / 2.0 : 960;
+        g_server.cursor_y = client->monitor_count > 0 ? client->monitors[0].height / 2.0 : 540;
+    }
+
+    LOG_INFO("Server: Registered %s '%s' with %d monitors (active: %s:%s)",
+             client->role, client->computer_id, client->monitor_count,
+             g_server.active_computer_id, g_server.active_monitor_id);
+
+    /* Send registration acknowledgment */
+    char response[2048];
+    snprintf(response, sizeof(response),
+             "{\"type\":\"registration_success\",\"computer_id\":\"%s\",\"status\":\"success\","
+             "\"active_monitor\":{\"computer_id\":\"%s\",\"monitor_id\":\"%s\","
+             "\"cursor_x\":%.1f,\"cursor_y\":%.1f}}",
+             client->computer_id, g_server.active_computer_id, g_server.active_monitor_id,
+             g_server.cursor_x, g_server.cursor_y);
+    server_send_to_client(client, response);
+
+    /* Notify all clients of the active monitor */
+    char active_msg[512];
+    snprintf(active_msg, sizeof(active_msg),
+             "{\"type\":\"active_monitor_changed\",\"computer_id\":\"%s\",\"monitor_id\":\"%s\","
+             "\"cursor_x\":%.1f,\"cursor_y\":%.1f}",
+             g_server.active_computer_id, g_server.active_monitor_id,
+             g_server.cursor_x, g_server.cursor_y);
+    server_broadcast(active_msg);
+}
+
+/* Handle input event from client and route to active computer */
+static void server_handle_input_event(ServerClient *sender, const char *json_data) {
+    /* Parse event_type */
+    char event_type[32] = "";
+    const char *et_start = strstr(json_data, "\"event_type\"");
+    if (et_start) {
+        et_start = strchr(et_start + 12, '"');
+        if (et_start) {
+            et_start++;
+            const char *et_end = strchr(et_start, '"');
+            if (et_end && et_end - et_start < (int)sizeof(event_type)) {
+                strncpy(event_type, et_start, et_end - et_start);
+                event_type[et_end - et_start] = '\0';
+            }
+        }
+    }
+
+    /* Build forwarding message with active computer info */
+    char fwd_msg[MAX_MESSAGE_SIZE];
+    size_t json_len = strlen(json_data);
+
+    /* Find the last } in the JSON */
+    const char *last_brace = strrchr(json_data, '}');
+    if (last_brace && json_len < MAX_MESSAGE_SIZE - 200) {
+        size_t prefix_len = last_brace - json_data;
+        memcpy(fwd_msg, json_data, prefix_len);
+        snprintf(fwd_msg + prefix_len, sizeof(fwd_msg) - prefix_len,
+                 ",\"active_computer_id\":\"%s\",\"active_monitor_id\":\"%s\"}",
+                 g_server.active_computer_id, g_server.active_monitor_id);
+    } else {
+        strncpy(fwd_msg, json_data, sizeof(fwd_msg) - 1);
+    }
+
+    /* Broadcast to all clients - each client decides if it should execute */
+    server_broadcast(fwd_msg);
+}
+
+/* Handle edge crossing request */
+static void server_handle_edge_crossing(const char *json_data) {
+    /* Parse edge crossing parameters */
+    char computer_id[MAX_HOSTNAME] = "";
+    char monitor_id[32] = "";
+    char edge[16] = "";
+    double position = 0.5;
+
+    const char *cid = strstr(json_data, "\"computer_id\"");
+    if (cid) {
+        cid = strchr(cid + 13, '"');
+        if (cid) {
+            cid++;
+            const char *end = strchr(cid, '"');
+            if (end && end - cid < MAX_HOSTNAME) {
+                strncpy(computer_id, cid, end - cid);
+            }
+        }
+    }
+
+    const char *mid = strstr(json_data, "\"monitor_id\"");
+    if (mid) {
+        mid = strchr(mid + 12, '"');
+        if (mid) {
+            mid++;
+            const char *end = strchr(mid, '"');
+            if (end && end - mid < 32) {
+                strncpy(monitor_id, mid, end - mid);
+            }
+        }
+    }
+
+    const char *edg = strstr(json_data, "\"edge\"");
+    if (edg) {
+        edg = strchr(edg + 6, '"');
+        if (edg) {
+            edg++;
+            const char *end = strchr(edg, '"');
+            if (end && end - edg < 16) {
+                strncpy(edge, edg, end - edg);
+            }
+        }
+    }
+
+    const char *pos = strstr(json_data, "\"position\"");
+    if (pos) {
+        pos = strchr(pos + 10, ':');
+        if (pos) position = atof(pos + 1);
+    }
+
+    LOG_INFO("Server: Edge crossing request from %s:%s edge=%s pos=%.2f",
+             computer_id, monitor_id, edge, position);
+
+    /* Find target computer - simple logic: cycle through registered players */
+    ServerClient *target = NULL;
+
+    /* Find a different registered client to switch to */
+    for (int i = 0; i < MAX_SERVER_CLIENTS; i++) {
+        if (g_server.clients[i].registered &&
+            strcmp(g_server.clients[i].computer_id, g_server.active_computer_id) != 0) {
+            target = &g_server.clients[i];
+            break;
+        }
+    }
+
+    if (!target) {
+        LOG_INFO("Server: No other computer to switch to");
+        return;
+    }
+
+    /* Update active computer */
+    strncpy(g_server.active_computer_id, target->computer_id, MAX_HOSTNAME - 1);
+    strcpy(g_server.active_monitor_id, target->monitor_count > 0 ? target->monitors[0].monitor_id : "m0");
+
+    /* Calculate cursor position on target */
+    double new_x = 100, new_y = 100;  /* Default offset from edge */
+    if (target->monitor_count > 0) {
+        Monitor *mon = &target->monitors[0];
+        if (strcmp(edge, "right") == 0) {
+            new_x = 50;  /* Enter from left */
+            new_y = position * mon->height;
+        } else if (strcmp(edge, "left") == 0) {
+            new_x = mon->width - 50;  /* Enter from right */
+            new_y = position * mon->height;
+        } else if (strcmp(edge, "bottom") == 0) {
+            new_x = position * mon->width;
+            new_y = 50;  /* Enter from top */
+        } else if (strcmp(edge, "top") == 0) {
+            new_x = position * mon->width;
+            new_y = mon->height - 50;  /* Enter from bottom */
+        }
+    }
+
+    g_server.cursor_x = new_x;
+    g_server.cursor_y = new_y;
+
+    LOG_INFO("Server: Switched active to %s:%s cursor=(%.1f, %.1f)",
+             g_server.active_computer_id, g_server.active_monitor_id, new_x, new_y);
+
+    /* Broadcast active monitor change to all clients */
+    char msg[512];
+    snprintf(msg, sizeof(msg),
+             "{\"type\":\"active_monitor_changed\",\"computer_id\":\"%s\",\"monitor_id\":\"%s\","
+             "\"cursor_x\":%.1f,\"cursor_y\":%.1f}",
+             g_server.active_computer_id, g_server.active_monitor_id, new_x, new_y);
+    server_broadcast(msg);
+}
+
+/* Handle message from client */
+static void server_handle_message(ServerClient *client, const char *json_data, size_t len) {
+    UNUSED(len);
+
+    /* Determine message type */
+    if (strstr(json_data, "\"type\":\"register_device\"") ||
+        strstr(json_data, "\"type\": \"register_device\"")) {
+        server_handle_registration(client, json_data);
+    } else if (strstr(json_data, "\"type\":\"input_event\"") ||
+               strstr(json_data, "\"type\": \"input_event\"")) {
+        server_handle_input_event(client, json_data);
+    } else if (strstr(json_data, "\"type\":\"edge_crossing_request\"") ||
+               strstr(json_data, "\"type\": \"edge_crossing_request\"")) {
+        server_handle_edge_crossing(json_data);
+    } else if (strstr(json_data, "\"type\":\"ping\"")) {
+        server_send_to_client(client, "{\"type\":\"pong\"}");
+    } else {
+        LOG_DEBUG("Server: Unknown message type: %.100s", json_data);
+    }
+}
+
+/* Server WebSocket callback */
+static int server_ws_callback(struct lws *wsi, enum lws_callback_reasons reason,
+                               void *user, void *in, size_t len) {
+    ServerClient *client = (ServerClient *)user;
+
+    switch (reason) {
+        case LWS_CALLBACK_ESTABLISHED:
+            LOG_INFO("Server: New connection");
+            if (!client) {
+                client = server_allocate_client(wsi);
+                if (!client) {
+                    LOG_ERROR("Server: Max clients reached");
+                    return -1;
+                }
+            }
+            client->wsi = wsi;
+            break;
+
+        case LWS_CALLBACK_RECEIVE:
+            if (!client) {
+                client = server_find_client_by_wsi(wsi);
+            }
+            if (client && len > 0 && in) {
+                if (client->rx_len + len < MAX_MESSAGE_SIZE) {
+                    memcpy(client->rx_buffer + client->rx_len, in, len);
+                    client->rx_len += len;
+                }
+                if (lws_is_final_fragment(wsi)) {
+                    client->rx_buffer[client->rx_len] = '\0';
+                    server_handle_message(client, client->rx_buffer, client->rx_len);
+                    client->rx_len = 0;
+                }
+            }
+            break;
+
+        case LWS_CALLBACK_CLOSED:
+            LOG_INFO("Server: Connection closed");
+            if (!client) {
+                client = server_find_client_by_wsi(wsi);
+            }
+            if (client) {
+                if (client->registered) {
+                    LOG_INFO("Server: Client '%s' disconnected", client->computer_id);
+
+                    /* If active computer disconnected, switch to another */
+                    if (strcmp(client->computer_id, g_server.active_computer_id) == 0) {
+                        g_server.active_computer_id[0] = '\0';
+                        for (int i = 0; i < MAX_SERVER_CLIENTS; i++) {
+                            if (g_server.clients[i].registered &&
+                                g_server.clients[i].wsi != wsi) {
+                                strncpy(g_server.active_computer_id,
+                                        g_server.clients[i].computer_id, MAX_HOSTNAME - 1);
+                                strcpy(g_server.active_monitor_id,
+                                       g_server.clients[i].monitor_count > 0 ?
+                                       g_server.clients[i].monitors[0].monitor_id : "m0");
+                                LOG_INFO("Server: Switched active to %s", g_server.active_computer_id);
+                                break;
+                            }
+                        }
+                    }
+                }
+                server_free_client(client);
+            }
+            break;
+
+        default:
+            break;
+    }
+
+    return 0;
+}
+
+/* Server protocols */
+static struct lws_protocols server_protocols[] = {
+    {
+        "kvm-protocol",
+        server_ws_callback,
+        sizeof(ServerClient),
+        MAX_MESSAGE_SIZE,
+        0, NULL, 0
+    },
+    { NULL, NULL, 0, 0, 0, NULL, 0 }
+};
+
+/* Start embedded WebSocket server */
+static int start_embedded_server(int port) {
+    struct lws_context_creation_info info;
+    memset(&info, 0, sizeof(info));
+
+    info.port = port;
+    info.protocols = server_protocols;
+    info.gid = -1;
+    info.uid = -1;
+    info.options = LWS_SERVER_OPTION_VALIDATE_UTF8;
+
+    g_server.ws_context = lws_create_context(&info);
+    if (!g_server.ws_context) {
+        LOG_ERROR("Failed to create server context");
+        return -1;
+    }
+
+    g_server.port = port;
+    g_server.running = true;
+    g_server.is_server_mode = true;
+
+    LOG_INFO("Embedded WebSocket server started on port %d", port);
+    return 0;
+}
+
 /* Protocol list */
 static struct lws_protocols protocols[] = {
     {
@@ -2916,7 +3434,8 @@ static void queue_ws_message(ClientState *client, const char *msg) {
 /* Send edge crossing request to server */
 static void send_edge_crossing_request(ClientState *client, const char *edge,
                                        float position, int cursor_x, int cursor_y) {
-    if (!client->running || !client->connected) return;
+    if (!client->running) return;
+    if (!g_server.is_server_mode && !client->connected) return;
     
     /* Only send from main computer when active */
     if (strcmp(client->config.role, "main") != 0 || !client->is_active) return;
@@ -2936,9 +3455,15 @@ static void send_edge_crossing_request(ClientState *client, const char *edge,
         "\"cursor_y\":%d}",
         client->config.computer_id, monitor_id, edge, position, cursor_x, cursor_y);
     
+    /* In server mode, handle edge crossing directly */
+    if (g_server.is_server_mode) {
+        server_handle_edge_crossing(json_msg);
+        return;
+    }
+
     char *msg = strdup(json_msg);
     if (!msg) return;
-    
+
     if (!msg_queue_push(&client->msg_queue, msg)) {
         LOG_WARN("Message queue full, dropping edge crossing request");
         free(msg);
@@ -2953,7 +3478,9 @@ static void send_edge_crossing_request(ClientState *client, const char *edge,
 static void send_input_event(ClientState *client, const char *event_type,
                              const char *json_data) {
     /* Fast path: Return immediately if not ready */
-    if (!client->running || !client->connected) return;
+    /* In server mode, we don't need client->connected */
+    if (!client->running) return;
+    if (!g_server.is_server_mode && !client->connected) return;
     
     /* Track performance for mouse moves (most frequent event) */
     static double last_perf_log_send = 0;
@@ -3021,7 +3548,26 @@ static void send_input_event(ClientState *client, const char *event_type,
             lws_cancel_service(client->ws_context);
         }
     }
-    
+
+    /* In server mode, also broadcast to connected clients */
+    if (g_server.is_server_mode && msg) {
+        /* Build full message with active computer info */
+        char full_msg[MAX_MESSAGE_SIZE];
+        size_t msg_len = strlen(msg);
+        /* Find last } to insert active computer info */
+        const char *last_brace = strrchr(msg, '}');
+        if (last_brace && msg_len < MAX_MESSAGE_SIZE - 200) {
+            size_t prefix_len = last_brace - msg;
+            memcpy(full_msg, msg, prefix_len);
+            snprintf(full_msg + prefix_len, sizeof(full_msg) - prefix_len,
+                     ",\"active_computer_id\":\"%s\",\"active_monitor_id\":\"%s\"}",
+                     g_server.active_computer_id, g_server.active_monitor_id);
+        } else {
+            strncpy(full_msg, msg, sizeof(full_msg) - 1);
+        }
+        server_broadcast(full_msg);
+    }
+
     free(msg);
 }
 
@@ -4578,6 +5124,7 @@ static void signal_handler(int sig) {
     LOG_INFO("Signal %d received, shutting down...", sig);
     g_shutdown = 1;
     g_client.running = false;
+    g_server.running = false;
     
 #ifdef PLATFORM_LINUX
     /* Stop server process if running */
@@ -4612,7 +5159,7 @@ static void signal_handler(int sig) {
 static void print_usage(const char *prog) {
     printf("Usage: %s [options]\n", prog);
     printf("\nOptions:\n");
-    printf("  --server URL       WebSocket server URL (default: ws://localhost:8765)\n");
+    printf("  --server URL       WebSocket server URL (for connecting to external server)\n");
     printf("  --computer-id ID   Unique computer identifier (default: hostname)\n");
     printf("  --role ROLE        Role: 'main' or 'player' (default: player)\n");
     printf("  --port PORT        Server port (default: 8765)\n");
@@ -4620,10 +5167,15 @@ static void print_usage(const char *prog) {
     printf("  --local-server     Start embedded Python server + client (main role)\n");
     printf("  --debug            Enable debug logging\n");
     printf("  --help             Show this help\n");
+    printf("\nModes:\n");
+    printf("  Server mode:  %s --role main --port 8765\n", prog);
+    printf("                Starts embedded server, other computers connect to this one.\n");
+    printf("  Client mode:  %s --role player --server ws://192.168.1.100:8765\n", prog);
+    printf("                Connects to an existing server.\n");
     printf("\nExamples:\n");
-    printf("  %s --role main --server ws://192.168.1.100:8765\n", prog);
-    printf("  %s --role player --server wss://myserver.com:443\n", prog);
-    printf("  %s --local-server --port 8765\n", prog);
+    printf("  %s --role main --port 8765           # Start as server on port 8765\n", prog);
+    printf("  %s --role player --server ws://192.168.1.100:8765  # Connect to server\n", prog);
+    printf("  %s --local-server --port 8765        # Start Python server + main client\n", prog);
 }
 
 int main(int argc, char *argv[]) {
@@ -4743,6 +5295,119 @@ int main(int argc, char *argv[]) {
         strcpy(g_client.config.role, "main");
         snprintf(g_client.config.server_url, sizeof(g_client.config.server_url),
                  "ws://127.0.0.1:%d", port);
+    } else if (strcmp(g_client.config.role, "main") == 0 && g_client.config.server_url[0] == '\0') {
+        /* --role main without --server: Run embedded server mode */
+        const char *local_ip = get_local_ip();
+        int port = g_client.config.port;
+        char *connection_code = generate_connection_code(local_ip, port);
+
+        printf("\n");
+        printf("╔═══════════════════════════════════════════════════════════════╗\n");
+        printf("║         EMBEDDED SERVER MODE (No External Server)             ║\n");
+        printf("╚═══════════════════════════════════════════════════════════════╝\n");
+        printf("\n");
+        printf("  Server IP:   %s\n", local_ip);
+        printf("  Server Port: %d\n", port);
+        printf("\n");
+        printf("  ┌─────────────────────────────────────────────────────────────┐\n");
+        printf("  │  CONNECTION CODE: %-40s │\n", connection_code ? connection_code : "ERROR");
+        printf("  └─────────────────────────────────────────────────────────────┘\n");
+        printf("\n");
+        printf("  On other computers, run:\n");
+#ifdef PLATFORM_WINDOWS
+        printf("    .\\input_unified.exe --role player --server ws://%s:%d\n", local_ip, port);
+#else
+        printf("    ./input_unified --role player --server ws://%s:%d\n", local_ip, port);
+#endif
+        printf("\n");
+        fflush(stdout);
+
+        if (connection_code) free(connection_code);
+
+        /* Start embedded WebSocket server */
+        if (start_embedded_server(port) != 0) {
+            LOG_ERROR("Failed to start embedded server");
+            cleanup_logging();
+            return 1;
+        }
+
+        /* Setup signal handlers */
+        signal(SIGINT, signal_handler);
+        signal(SIGTERM, signal_handler);
+#ifndef PLATFORM_WINDOWS
+        signal(SIGPIPE, SIG_IGN);
+#endif
+
+        LOG_INFO("=== Unified Input Server v%s ===", VERSION);
+        LOG_INFO("Platform: %s", PLATFORM_NAME);
+        LOG_INFO("Computer ID: %s", g_client.config.computer_id);
+        LOG_INFO("Role: main (embedded server)");
+        LOG_INFO("Listening on port: %d", port);
+        LOG_INFO("Monitors: %d", g_client.monitor_count);
+
+        /* Register local machine as first client */
+        ServerClient *local_client = &g_server.clients[0];
+        strncpy(local_client->computer_id, g_client.config.computer_id, MAX_HOSTNAME - 1);
+        strcpy(local_client->role, "main");
+        local_client->monitor_count = g_client.monitor_count;
+        for (int i = 0; i < g_client.monitor_count && i < MAX_MONITORS; i++) {
+            memcpy(&local_client->monitors[i], &g_client.monitors[i], sizeof(Monitor));
+        }
+        local_client->registered = true;
+        local_client->wsi = NULL;  /* Local client has no WSI */
+        g_server.client_count = 1;
+
+        /* Set this machine as active */
+        strncpy(g_server.active_computer_id, g_client.config.computer_id, MAX_HOSTNAME - 1);
+        strcpy(g_server.active_monitor_id, g_client.monitor_count > 0 ? g_client.monitors[0].monitor_id : "m0");
+        g_server.cursor_x = g_client.monitor_count > 0 ? g_client.monitors[0].width / 2.0 : 960;
+        g_server.cursor_y = g_client.monitor_count > 0 ? g_client.monitors[0].height / 2.0 : 540;
+
+        g_client.is_active = true;  /* Main is active by default */
+        g_client.running = true;
+
+#ifdef PLATFORM_WINDOWS
+        /* Setup Windows input hooks for main role */
+        if (!setup_windows_hooks(&g_client)) {
+            LOG_WARN("Windows input hooks not available - input capture disabled");
+        }
+#endif
+
+        LOG_INFO("Server running. Waiting for player connections...");
+        LOG_INFO("Press Ctrl+C to stop.");
+
+        /* Server main loop */
+        while (g_server.running && !g_shutdown) {
+#ifdef PLATFORM_WINDOWS
+            /* Process Windows messages (required for low-level hooks to work) */
+            MSG msg;
+            while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+            }
+#endif
+            /* Service WebSocket server */
+            int n = lws_service(g_server.ws_context, 10);
+            if (n < 0) {
+                LOG_ERROR("WebSocket service error");
+                break;
+            }
+        }
+
+        /* Cleanup server */
+        LOG_INFO("Shutting down server...");
+#ifdef PLATFORM_WINDOWS
+        remove_windows_hooks(&g_client);
+#endif
+        if (g_server.ws_context) {
+            lws_context_destroy(g_server.ws_context);
+            g_server.ws_context = NULL;
+        }
+
+        client_cleanup(&g_client);
+        cleanup_logging();
+        return 0;
+
     } else {
         /* Build server URL if not specified */
         if (g_client.config.server_url[0] == '\0') {
@@ -4752,7 +5417,7 @@ int main(int argc, char *argv[]) {
                      g_client.config.port);
         }
     }
-    
+
     /* Setup signal handlers */
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
@@ -4886,12 +5551,16 @@ int main(int argc, char *argv[]) {
         }
         
         /* Start clipboard monitor thread for all roles */
+        /* TODO: Fix clipboard_monitor_thread visibility - temporarily disabled */
+        g_client.clipboard_thread_running = false;
+        /*
         g_client.clipboard_thread_running = true;
         if (pthread_create(&g_client.clipboard_thread, NULL,
                            clipboard_monitor_thread, &g_client) != 0) {
             LOG_ERROR("Failed to create clipboard monitor thread");
             g_client.clipboard_thread_running = false;
         }
+        */
 #endif
         
         /* Main event loop */
