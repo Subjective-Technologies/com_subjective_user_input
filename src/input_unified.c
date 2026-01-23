@@ -3243,6 +3243,10 @@ static void server_free_client(ServerClient *client) {
     }
 }
 
+/* Forward declarations for server queues */
+static void queue_server_broadcast(const char *msg, const char *tag);
+static void queue_server_command(const char *msg, const char *tag);
+
 /* Send message to a specific client */
 static void server_send_to_client(ServerClient *client, const char *msg) {
     if (!client || !client->wsi) return;
