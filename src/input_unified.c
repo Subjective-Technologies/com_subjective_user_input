@@ -3590,6 +3590,87 @@ static void server_handle_input_event(ServerClient *sender, const char *json_dat
         }
     }
 
+    /* CLIPBOARD: Server must update its own clipboard since it's not a WebSocket client to itself */
+    if (strcmp(event_type, "clipboard_update") == 0) {
+        /* Parse source and content from the data field */
+        const char *data_start = strstr(json_data, "\"data\"");
+        if (data_start) {
+            /* Parse source */
+            char source[MAX_HOSTNAME] = "";
+            const char *src_start = strstr(data_start, "\"source\"");
+            if (src_start) {
+                src_start = strchr(src_start + 8, '"');
+                if (src_start) {
+                    src_start++;
+                    const char *src_end = strchr(src_start, '"');
+                    if (src_end && src_end - src_start < MAX_HOSTNAME) {
+                        strncpy(source, src_start, src_end - src_start);
+                        source[src_end - src_start] = '\0';
+                    }
+                }
+            }
+
+            /* Don't update if this is from ourselves (the main computer) */
+            if (source[0] && strcmp(source, g_client.config.computer_id) != 0) {
+                /* Parse content */
+                const char *content_start = strstr(data_start, "\"content\"");
+                if (content_start) {
+                    content_start = strchr(content_start + 9, '"');
+                    if (content_start) {
+                        content_start++;
+                        /* Find end of content string (handle escaped quotes) */
+                        const char *content_end = content_start;
+                        while (*content_end && !(*content_end == '"' && *(content_end - 1) != '\\')) {
+                            content_end++;
+                        }
+                        size_t content_len = content_end - content_start;
+                        if (content_len > 0 && content_len < CLIPBOARD_MAX_SIZE) {
+                            char *content = malloc(content_len + 1);
+                            if (content) {
+                                memcpy(content, content_start, content_len);
+                                content[content_len] = '\0';
+
+                                /* Unescape the content (basic JSON unescaping) */
+                                char *dst = content;
+                                const char *src = content;
+                                while (*src) {
+                                    if (*src == '\\' && *(src + 1)) {
+                                        src++;
+                                        switch (*src) {
+                                            case 'n': *dst++ = '\n'; break;
+                                            case 'r': *dst++ = '\r'; break;
+                                            case 't': *dst++ = '\t'; break;
+                                            case '"': *dst++ = '"'; break;
+                                            case '\\': *dst++ = '\\'; break;
+                                            default: *dst++ = *src; break;
+                                        }
+                                        src++;
+                                    } else {
+                                        *dst++ = *src++;
+                                    }
+                                }
+                                *dst = '\0';
+                                content_len = dst - content;
+
+                                if (clipboard_set(content, content_len)) {
+                                    /* Update tracking to prevent re-sending */
+                                    if (content_len < sizeof(g_client.last_clipboard)) {
+                                        memcpy(g_client.last_clipboard, content, content_len + 1);
+                                        g_client.last_clipboard_len = content_len;
+                                    }
+                                    LOG_INFO("📋 Server: Set clipboard from %s (%zu chars)", source, content_len);
+                                } else {
+                                    LOG_WARN("📋 Server: Failed to set clipboard");
+                                }
+                                free(content);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /* Build forwarding message with active computer info */
     char fwd_msg[MAX_MESSAGE_SIZE];
     size_t json_len = strlen(json_data);
