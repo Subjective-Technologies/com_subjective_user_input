@@ -2689,21 +2689,29 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
 
 /* Windows low-level mouse hook */
 static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    /* Debug: Log first few hook calls */
+    static int debug_count = 0;
+    if (debug_count < 5) {
+        debug_count++;
+        LOG_INFO("HOOK DEBUG #%d: nCode=%d, running=%d, role=%s, server_mode=%d",
+                 debug_count, nCode, g_client.running, g_client.config.role, g_server.is_server_mode);
+    }
+
     /* CRITICAL: Always call CallNextHookEx first for non-negative codes to avoid blocking */
     if (nCode < 0) {
         return CallNextHookEx(NULL, nCode, wParam, lParam);
     }
-    
+
     /* Fast path: Return immediately if not in main role or not running */
     if (!g_client.running || strcmp(g_client.config.role, "main") != 0) {
         return CallNextHookEx(NULL, nCode, wParam, lParam);
     }
-    
+
     /* Skip if executing received input (to avoid capturing our own injected events) */
     if (g_client.executing_input) {
         return CallNextHookEx(NULL, nCode, wParam, lParam);
     }
-    
+
     MSLLHOOKSTRUCT *ms = (MSLLHOOKSTRUCT *)lParam;
     POINT pt = ms->pt;
     
@@ -3740,6 +3748,14 @@ static void send_mouse_move_fast(ClientState *client, int x, int y, double now_m
 /* Send input event to server (uses thread-safe message queue) */
 static void send_input_event(ClientState *client, const char *event_type,
                              const char *json_data) {
+    /* Debug: Log first few calls */
+    static int send_debug_count = 0;
+    if (send_debug_count < 10) {
+        send_debug_count++;
+        LOG_INFO("SEND DEBUG #%d: type=%s, running=%d, server_mode=%d, connected=%d",
+                 send_debug_count, event_type, client->running, g_server.is_server_mode, client->connected);
+    }
+
     /* Fast path: Return immediately if not ready */
     /* In server mode, we don't need client->connected */
     if (!client->running) return;
@@ -5182,7 +5198,13 @@ int main(int argc, char *argv[]) {
             /* Process broadcast queue (drain messages queued by hooks) */
             char queued_msg[MSG_MAX_LEN];
             int broadcast_sent = 0;
+            static int total_broadcast = 0;
             while (msg_queue_pop(&g_server.broadcast_queue, queued_msg, sizeof(queued_msg))) {
+                total_broadcast++;
+                if (total_broadcast <= 5) {
+                    LOG_INFO("QUEUE DEBUG #%d: sending msg to clients, client_count=%d",
+                             total_broadcast, g_server.client_count);
+                }
                 /* Send to all registered clients */
                 for (int i = 0; i < MAX_SERVER_CLIENTS; i++) {
                     if (g_server.clients[i].registered && g_server.clients[i].wsi) {
