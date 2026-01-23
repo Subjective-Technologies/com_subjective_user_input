@@ -3375,6 +3375,13 @@ static void server_handle_registration(ServerClient *client, const char *json_da
              g_server.active_computer_id, g_server.active_monitor_id,
              g_server.cursor_x, g_server.cursor_y);
     server_broadcast(active_msg);
+
+    /* Apply active change locally in embedded server mode */
+    if (g_server.is_server_mode && strcmp(g_client.config.role, "main") == 0) {
+        apply_active_monitor_changed(&g_client, g_server.active_computer_id,
+                                     g_server.active_monitor_id,
+                                     g_server.cursor_x, g_server.cursor_y);
+    }
 }
 
 /* Handle input event from client and route to active computer */
@@ -3467,6 +3474,26 @@ static void server_handle_edge_crossing(const char *json_data) {
     LOG_INFO("Server: Edge crossing request from %s:%s edge=%s pos=%.2f",
              computer_id, monitor_id, edge, position);
 
+    /* Ignore edge requests from inactive computers to prevent flip-flop */
+    if (g_server.active_computer_id[0] &&
+        strcmp(computer_id, g_server.active_computer_id) != 0) {
+        static int ignore_count = 0;
+        ignore_count++;
+        if (ignore_count <= 5 || ignore_count % 50 == 0) {
+            LOG_INFO("Server: Ignoring edge crossing from inactive %s (active=%s)",
+                     computer_id, g_server.active_computer_id);
+        }
+        return;
+    }
+
+    /* Debounce rapid edge crossings */
+    double now_ms = get_time_ms();
+    if (g_server.last_edge_crossing_time > 0 &&
+        now_ms - g_server.last_edge_crossing_time < 200) {
+        return;
+    }
+    g_server.last_edge_crossing_time = now_ms;
+
     /* Find target computer - simple logic: cycle through registered players */
     ServerClient *target = NULL;
 
@@ -3520,6 +3547,12 @@ static void server_handle_edge_crossing(const char *json_data) {
              "\"cursor_x\":%.1f,\"cursor_y\":%.1f}",
              g_server.active_computer_id, g_server.active_monitor_id, new_x, new_y);
     server_broadcast(msg);
+
+    /* Apply active change locally in embedded server mode */
+    if (g_server.is_server_mode && strcmp(g_client.config.role, "main") == 0) {
+        apply_active_monitor_changed(&g_client, g_server.active_computer_id,
+                                     g_server.active_monitor_id, new_x, new_y);
+    }
 }
 
 /* Handle message from client */
@@ -4085,39 +4118,38 @@ static void handle_input_event(ClientState *client, JsonValue *msg) {
     client->executing_input = false;
 }
 
-static void handle_active_monitor_changed(ClientState *client, JsonValue *msg) {
-    const char *new_computer = json_get_string(msg, "computer_id", "");
-    const char *new_monitor = json_get_string(msg, "monitor_id", "");
-    double cursor_x = json_get_number(msg, "cursor_x", -1);
-    double cursor_y = json_get_number(msg, "cursor_y", -1);
-    
+static void apply_active_monitor_changed(ClientState *client,
+                                         const char *new_computer,
+                                         const char *new_monitor,
+                                         double cursor_x,
+                                         double cursor_y) {
     LOG_INFO("Active monitor changed to %s:%s", new_computer, new_monitor);
-    
+
     /* CRITICAL: Clear stale events from queue on ANY edge crossing
      * Old positions would cause erratic cursor jumps on the new active computer */
     msg_queue_clear(&client->msg_queue);
-    
+
     bool was_active = client->is_active;
     client->is_active = (strcmp(new_computer, client->config.computer_id) == 0);
-    strncpy(client->active_monitor_computer, new_computer, 
+    strncpy(client->active_monitor_computer, new_computer,
             sizeof(client->active_monitor_computer) - 1);
     LOG_INFO("Active state: was_active=%d now_active=%d role=%s",
              was_active, client->is_active, client->config.role);
-    
+
     if (client->is_active) {
         /* This computer is now ACTIVE */
 #ifdef PLATFORM_LINUX
         /* Show cursor */
         show_cursor_linux(client->x_display);
-        
+
         /* Ungrab input so local keyboard/mouse works */
         x11_ungrab_input(client->x_display);
-        
+
         if (strcmp(client->config.role, "main") == 0) {
             ungrab_evdev_devices(client->evdev_fds, client->evdev_count);
             client->input_grabbed = false;
         }
-        
+
         /* Set cursor to server position */
         if (cursor_x >= 0 && cursor_y >= 0 && client->x_display) {
             client->skip_mouse_moves = 10;
@@ -4136,14 +4168,14 @@ static void handle_active_monitor_changed(ClientState *client, JsonValue *msg) {
         while (ShowCursor(TRUE) < 0);  /* Ensure cursor is visible */
 #endif
         LOG_INFO("This computer is now ACTIVE - local input enabled");
-        
+
     } else {
         /* This computer is now INACTIVE */
 #ifdef PLATFORM_LINUX
         if (strcmp(client->config.role, "main") == 0) {
             if (was_active && client->monitor_count > 0) {
                 warp_cursor_to_center_linux(client->x_display, &client->monitors[0]);
-                
+
                 /* CRITICAL: Notify server that cursor was warped
                  * This resets the server's delta tracking to prevent wrong positions */
                 Monitor *mon = &client->monitors[0];
@@ -4157,23 +4189,31 @@ static void handle_active_monitor_changed(ClientState *client, JsonValue *msg) {
             grab_evdev_devices(client->evdev_fds, client->evdev_count);
             client->input_grabbed = true;
         }
-        
+
         /* Grab X11 input to block local keyboard/mouse */
         x11_grab_input(client->x_display);
-        
+
         /* Hide cursor */
         hide_cursor_linux(client->x_display);
 #endif
 #ifdef PLATFORM_WINDOWS
-        /* Windows main role currently does not suppress local input events */
         if (strcmp(client->config.role, "main") == 0) {
-            LOG_INFO("Windows main inactive: local input still enabled (hook does not block)");
+            LOG_INFO("Windows main inactive: local input blocked by hooks");
         }
         /* Hide cursor */
         while (ShowCursor(FALSE) >= 0);  /* Hide cursor */
 #endif
         LOG_INFO("This computer is INACTIVE - local input blocked");
     }
+}
+
+static void handle_active_monitor_changed(ClientState *client, JsonValue *msg) {
+    const char *new_computer = json_get_string(msg, "computer_id", "");
+    const char *new_monitor = json_get_string(msg, "monitor_id", "");
+    double cursor_x = json_get_number(msg, "cursor_x", -1);
+    double cursor_y = json_get_number(msg, "cursor_y", -1);
+
+    apply_active_monitor_changed(client, new_computer, new_monitor, cursor_x, cursor_y);
 }
 
 static void handle_registration_response(ClientState *client, JsonValue *msg) {
