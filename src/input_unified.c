@@ -2720,6 +2720,15 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
         return CallNextHookEx(NULL, nCode, wParam, lParam);
     }
 
+    /* Log inactive state a few times to confirm local input is not suppressed */
+    if (!g_client.is_active) {
+        static int inactive_log_count = 0;
+        if (inactive_log_count < 5) {
+            inactive_log_count++;
+            LOG_INFO("HOOK: main is inactive (local input not blocked on Windows)");
+        }
+    }
+
     MSLLHOOKSTRUCT *ms = (MSLLHOOKSTRUCT *)lParam;
     POINT pt = ms->pt;
     
@@ -3855,6 +3864,12 @@ static void send_input_event(ClientState *client, const char *event_type,
     
     /* In server mode, queue message for async broadcast (avoid blocking hook) */
     if (g_server.is_server_mode) {
+        static int server_send_debug = 0;
+        if (server_send_debug < 5) {
+            server_send_debug++;
+            LOG_INFO("SEND DEBUG server: active=%s:%s event=%s",
+                     g_server.active_computer_id, g_server.active_monitor_id, event_type);
+        }
         /* Build full message with active computer info */
         char full_msg[MAX_MESSAGE_SIZE];
         size_t msg_len = strlen(msg);
@@ -4077,6 +4092,8 @@ static void handle_active_monitor_changed(ClientState *client, JsonValue *msg) {
     client->is_active = (strcmp(new_computer, client->config.computer_id) == 0);
     strncpy(client->active_monitor_computer, new_computer, 
             sizeof(client->active_monitor_computer) - 1);
+    LOG_INFO("Active state: was_active=%d now_active=%d role=%s",
+             was_active, client->is_active, client->config.role);
     
     if (client->is_active) {
         /* This computer is now ACTIVE */
@@ -4139,6 +4156,10 @@ static void handle_active_monitor_changed(ClientState *client, JsonValue *msg) {
         hide_cursor_linux(client->x_display);
 #endif
 #ifdef PLATFORM_WINDOWS
+        /* Windows main role currently does not suppress local input events */
+        if (strcmp(client->config.role, "main") == 0) {
+            LOG_INFO("Windows main inactive: local input still enabled (hook does not block)");
+        }
         /* Hide cursor */
         while (ShowCursor(FALSE) >= 0);  /* Hide cursor */
 #endif
