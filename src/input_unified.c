@@ -272,6 +272,11 @@ typedef struct {
     
 } ClientState;
 
+/* Forward declarations (used across platforms) */
+static void send_input_event(ClientState *client, const char *event_type,
+                             const char *json_data);
+static void* clipboard_monitor_thread(void *arg);
+
 /* ============================================================================
  * Embedded Server State (for --role main server mode)
  * ============================================================================ */
@@ -667,12 +672,18 @@ static void msg_queue_clear(MessageQueue *q) {
 #ifdef PLATFORM_LINUX
     pthread_mutex_lock(&q->mutex);
 #endif
+#ifdef PLATFORM_WINDOWS
+    if (q->cs_initialized) EnterCriticalSection(&q->cs);
+#endif
     int cleared = q->count;
     q->head = 0;
     q->tail = 0;
     q->count = 0;
 #ifdef PLATFORM_LINUX
     pthread_mutex_unlock(&q->mutex);
+#endif
+#ifdef PLATFORM_WINDOWS
+    if (q->cs_initialized) LeaveCriticalSection(&q->cs);
 #endif
     if (cleared > 0) {
         LOG_INFO("Cleared %d stale messages from queue", cleared);
@@ -1667,6 +1678,8 @@ static void inject_mouse_scroll_linux(Display *display, int dx, int dy) {
     XFlush(display);
 }
 
+#endif /* PLATFORM_LINUX */
+
 /* ============================================================================
  * Clipboard Sharing
  * ============================================================================ */
@@ -1674,6 +1687,7 @@ static void inject_mouse_scroll_linux(Display *display, int dx, int dy) {
 #define CLIPBOARD_MAX_SIZE 65536  /* Max 64KB clipboard */
 #define CLIPBOARD_CHECK_INTERVAL_MS 500  /* Check every 500ms */
 
+#ifdef PLATFORM_LINUX
 /* Get clipboard content using xclip */
 static char* clipboard_get_linux(void) {
     /* Use popen to run xclip and capture output */
@@ -1727,6 +1741,7 @@ static bool clipboard_set_linux(const char *content, size_t len) {
     
     return true;
 }
+#endif
 
 #ifdef PLATFORM_WINDOWS
 static bool clipboard_open_with_retry(void) {
@@ -1989,6 +2004,7 @@ static void handle_clipboard_update(ClientState *client, JsonValue *msg) {
     }
 }
 
+#ifdef PLATFORM_LINUX
 static void warp_cursor_to_center_linux(Display *display, Monitor *monitor) {
     if (!display || !monitor) return;
     
@@ -2629,6 +2645,7 @@ static void send_input_event(ClientState *client, const char *event_type,
                              const char *json_data);
 static void send_edge_crossing_request(ClientState *client, const char *edge,
                                        float position, int cursor_x, int cursor_y);
+static void send_mouse_move_fast(ClientState *client, int x, int y, double now_ms);
 
 /* Windows low-level keyboard hook */
 static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
@@ -2734,9 +2751,7 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
             }
             
             if (should_send) {
-                char json[128];
-                snprintf(json, sizeof(json), "{\"x\":%d,\"y\":%d}", pt.x, pt.y);
-                send_input_event(&g_client, "mouse_move", json);
+                send_mouse_move_fast(&g_client, pt.x, pt.y, now);
                 last_move_time = now;
                 last_x = pt.x;
                 last_y = pt.y;
@@ -3620,6 +3635,38 @@ static void queue_ws_message(ClientState *client, const char *msg) {
     }
 }
 
+/* Queue message to client send queue (thread-safe). */
+static void queue_client_message(ClientState *client, const char *msg, const char *tag) {
+    if (!msg_queue_push(&client->msg_queue, msg)) {
+        static int drop_count = 0;
+        drop_count++;
+        if (drop_count <= 3 || drop_count % 100 == 0) {
+            LOG_WARN("Message queue full, dropping %s (%d total)", tag, drop_count);
+        }
+        return;
+    }
+
+    if (client->ws_context) {
+        lws_cancel_service(client->ws_context);
+    }
+}
+
+/* Queue message to server broadcast queue (thread-safe). */
+static void queue_server_broadcast(const char *msg, const char *tag) {
+    if (!msg_queue_push(&g_server.broadcast_queue, msg)) {
+        static int drop_count = 0;
+        drop_count++;
+        if (drop_count <= 3 || drop_count % 100 == 0) {
+            LOG_WARN("Server broadcast queue full, dropping %s (%d total)", tag, drop_count);
+        }
+        return;
+    }
+
+    if (g_server.ws_context) {
+        lws_cancel_service(g_server.ws_context);
+    }
+}
+
 /* Send edge crossing request to server */
 static void send_edge_crossing_request(ClientState *client, const char *edge,
                                        float position, int cursor_x, int cursor_y) {
@@ -3649,18 +3696,45 @@ static void send_edge_crossing_request(ClientState *client, const char *edge,
         server_handle_edge_crossing(json_msg);
         return;
     }
+    queue_client_message(client, json_msg, "edge_crossing_request");
+    LOG_INFO("Queued edge_crossing_request: edge=%s pos=%.2f cursor=(%d,%d)",
+             edge, position, cursor_x, cursor_y);
+}
 
-    char *msg = strdup(json_msg);
-    if (!msg) return;
+/* Fast path for high-frequency mouse moves (avoid heap allocations). */
+static void send_mouse_move_fast(ClientState *client, int x, int y, double now_ms) {
+    if (!client->running) return;
+    if (!g_server.is_server_mode && !client->connected) return;
 
-    if (!msg_queue_push(&client->msg_queue, msg)) {
-        LOG_WARN("Message queue full, dropping edge crossing request");
-        free(msg);
-    } else {
-        if (client->ws_context) {
-            lws_cancel_service(client->ws_context);
+    double delta_ms = (client->last_input_time > 0) ? (now_ms - client->last_input_time) : 0;
+    client->last_input_time = now_ms;
+
+    if (g_server.is_server_mode) {
+        char full_msg[512];
+        int n = snprintf(full_msg, sizeof(full_msg),
+            "{\"type\":\"input_event\",\"event_type\":\"mouse_move\","
+            "\"data\":{\"x\":%d,\"y\":%d},\"device_id\":\"%s\",\"delta_ms\":%.2f,"
+            "\"active_computer_id\":\"%s\",\"active_monitor_id\":\"%s\"}",
+            x, y, client->config.computer_id, delta_ms,
+            g_server.active_computer_id, g_server.active_monitor_id);
+        if (n < 0 || n >= (int)sizeof(full_msg)) {
+            LOG_WARN("mouse_move message too large, dropping");
+            return;
         }
+        queue_server_broadcast(full_msg, "mouse_move");
+        return;
     }
+
+    char msg[256];
+    int n = snprintf(msg, sizeof(msg),
+        "{\"type\":\"input_event\",\"event_type\":\"mouse_move\","
+        "\"data\":{\"x\":%d,\"y\":%d},\"device_id\":\"%s\",\"delta_ms\":%.2f}",
+        x, y, client->config.computer_id, delta_ms);
+    if (n < 0 || n >= (int)sizeof(msg)) {
+        LOG_WARN("mouse_move message too large, dropping");
+        return;
+    }
+    queue_client_message(client, msg, "mouse_move");
 }
 
 /* Send input event to server (uses thread-safe message queue) */
@@ -3721,32 +3795,14 @@ static void send_input_event(ClientState *client, const char *event_type,
         }
 
         /* Queue message instead of direct broadcast (thread-safe for hooks) */
-        if (!msg_queue_push(&g_server.broadcast_queue, full_msg)) {
-            static int overflow_count = 0;
-            overflow_count++;
-            if (overflow_count <= 3 || overflow_count % 100 == 0) {
-                LOG_WARN("Server broadcast queue full, dropping event (%d total)", overflow_count);
-            }
-        } else {
-            /* Wake up lws event loop to process queued messages */
-            if (g_server.ws_context) {
-                lws_cancel_service(g_server.ws_context);
-            }
-        }
+        queue_server_broadcast(full_msg, event_type);
 
         free(msg);
         return;
     }
 
     /* Client mode: Use thread-safe queue for input events */
-    if (!msg_queue_push(&client->msg_queue, msg)) {
-        static int overflow_count = 0;
-        overflow_count++;
-        if (overflow_count <= 3 || overflow_count % 100 == 0) {
-            LOG_WARN("Message queue full, dropping input event (%d total)", overflow_count);
-        }
-        free(msg);
-    } else {
+    if (msg_queue_push(&client->msg_queue, msg)) {
         /* Log send performance for mouse moves */
         if (is_mouse_move) {
             send_count++;
@@ -3771,6 +3827,13 @@ static void send_input_event(ClientState *client, const char *event_type,
          * lws_callback_on_writable is NOT thread-safe and causes delays! */
         if (client->ws_context) {
             lws_cancel_service(client->ws_context);
+        }
+        free(msg);
+    } else {
+        static int overflow_count = 0;
+        overflow_count++;
+        if (overflow_count <= 3 || overflow_count % 100 == 0) {
+            LOG_WARN("Message queue full, dropping %s (%d total)", event_type, overflow_count);
         }
         free(msg);
     }
@@ -5287,16 +5350,12 @@ int main(int argc, char *argv[]) {
         }
         
         /* Start clipboard monitor thread for all roles */
-        /* TODO: Fix clipboard_monitor_thread visibility - temporarily disabled */
-        g_client.clipboard_thread_running = false;
-        /*
         g_client.clipboard_thread_running = true;
         if (pthread_create(&g_client.clipboard_thread, NULL,
                            clipboard_monitor_thread, &g_client) != 0) {
             LOG_ERROR("Failed to create clipboard monitor thread");
             g_client.clipboard_thread_running = false;
         }
-        */
 #endif
         
         /* Main event loop */
