@@ -263,6 +263,9 @@ typedef struct {
 #ifdef PLATFORM_WINDOWS
     HHOOK keyboard_hook;
     HHOOK mouse_hook;
+    HANDLE hook_thread;
+    DWORD hook_thread_id;
+    bool hook_thread_running;
 #endif
     
 #ifdef PLATFORM_MACOS
@@ -2890,6 +2893,60 @@ static void remove_windows_hooks(ClientState *client) {
         client->mouse_hook = NULL;
     }
 }
+
+/* Run Windows hooks on a dedicated thread with its own message loop. */
+static DWORD WINAPI hook_thread_proc(LPVOID param) {
+    ClientState *client = (ClientState *)param;
+    MSG msg;
+
+    /* Ensure the thread has a message queue before we post to it. */
+    PeekMessage(&msg, NULL, WM_USER, WM_USER, PM_NOREMOVE);
+
+    if (!setup_windows_hooks(client)) {
+        LOG_WARN("Windows input hooks not available - input capture disabled");
+        return 1;
+    }
+
+    client->hook_thread_running = true;
+
+    while (client->running && GetMessage(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    client->hook_thread_running = false;
+    remove_windows_hooks(client);
+    return 0;
+}
+
+static bool start_windows_hook_thread(ClientState *client) {
+    if (client->hook_thread) {
+        return true;
+    }
+
+    client->hook_thread_running = false;
+    client->hook_thread = CreateThread(NULL, 0, hook_thread_proc, client, 0,
+                                       &client->hook_thread_id);
+    if (!client->hook_thread) {
+        LOG_ERROR("Failed to create Windows hook thread (error: %lu)", GetLastError());
+        return false;
+    }
+
+    return true;
+}
+
+static void stop_windows_hook_thread(ClientState *client) {
+    if (!client->hook_thread) {
+        return;
+    }
+
+    /* Signal the hook thread to exit its message loop. */
+    PostThreadMessage(client->hook_thread_id, WM_QUIT, 0, 0);
+    WaitForSingleObject(client->hook_thread, 2000);
+    CloseHandle(client->hook_thread);
+    client->hook_thread = NULL;
+    client->hook_thread_id = 0;
+}
 #endif
 
 #ifdef PLATFORM_MACOS
@@ -4754,8 +4811,8 @@ static void client_cleanup(ClientState *client) {
     }
 #endif
 #ifdef PLATFORM_WINDOWS
-    /* Remove Windows input hooks */
-    remove_windows_hooks(client);
+    /* Stop Windows hook thread (removes hooks internally) */
+    stop_windows_hook_thread(client);
     
     /* Show cursor */
     while (ShowCursor(TRUE) < 0);
@@ -5169,8 +5226,8 @@ int main(int argc, char *argv[]) {
         g_client.running = true;
 
 #ifdef PLATFORM_WINDOWS
-        /* Setup Windows input hooks for main role */
-        if (!setup_windows_hooks(&g_client)) {
+        /* Start Windows input hooks on a dedicated thread */
+        if (!start_windows_hook_thread(&g_client)) {
             LOG_WARN("Windows input hooks not available - input capture disabled");
         }
 #endif
@@ -5180,14 +5237,6 @@ int main(int argc, char *argv[]) {
 
         /* Server main loop */
         while (g_server.running && !g_shutdown) {
-#ifdef PLATFORM_WINDOWS
-            /* Process Windows messages (required for low-level hooks to work) */
-            MSG msg;
-            while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-                TranslateMessage(&msg);
-                DispatchMessage(&msg);
-            }
-#endif
             /* Service WebSocket server */
             int n = lws_service(g_server.ws_context, 10);
             if (n < 0) {
@@ -5225,7 +5274,7 @@ int main(int argc, char *argv[]) {
         /* Cleanup server */
         LOG_INFO("Shutting down server...");
 #ifdef PLATFORM_WINDOWS
-        remove_windows_hooks(&g_client);
+        stop_windows_hook_thread(&g_client);
 #endif
         if (g_server.ws_context) {
             lws_context_destroy(g_server.ws_context);
