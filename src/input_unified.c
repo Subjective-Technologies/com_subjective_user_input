@@ -3482,8 +3482,8 @@ static void server_handle_edge_crossing(const char *json_data) {
         if (pos) position = atof(pos + 1);
     }
 
-    LOG_INFO("Server: Edge crossing request from %s:%s edge=%s pos=%.2f",
-             computer_id, monitor_id, edge, position);
+    LOG_INFO("Server: Edge crossing request from %s:%s edge=%s pos=%.2f cursor=(%d,%d)",
+             computer_id, monitor_id, edge, position, cursor_x, cursor_y);
 
     /* Ignore edge requests from inactive computers to prevent flip-flop */
     if (g_server.active_computer_id[0] &&
@@ -3837,9 +3837,11 @@ static void send_edge_crossing_request(ClientState *client, const char *edge,
         "\"cursor_x\":%d,"
         "\"cursor_y\":%d}",
         client->config.computer_id, monitor_id, edge, position, cursor_x, cursor_y);
-    
+
     /* In server mode, handle edge crossing directly */
     if (g_server.is_server_mode) {
+        LOG_INFO("Edge request queued (server mode): edge=%s pos=%.2f cursor=(%d,%d)",
+                 edge, position, cursor_x, cursor_y);
         queue_server_command(json_msg, "edge_crossing_request");
         return;
     }
@@ -4236,6 +4238,11 @@ static void apply_active_monitor_changed(ClientState *client,
 
 /* Queue command for server thread (thread-safe). */
 static void queue_server_command(const char *msg, const char *tag) {
+    static int log_count = 0;
+    if (log_count < 10) {
+        log_count++;
+        LOG_INFO("Server command queued #%d: %s %.120s", log_count, tag, msg);
+    }
     if (!msg_queue_push(&g_server.command_queue, msg)) {
         static int drop_count = 0;
         drop_count++;
@@ -5365,9 +5372,15 @@ int main(int argc, char *argv[]) {
             char cmd_msg[MSG_MAX_LEN];
             int cmd_count = 0;
             while (msg_queue_pop(&g_server.command_queue, cmd_msg, sizeof(cmd_msg))) {
+                if (cmd_count == 0) {
+                    LOG_INFO("Server command processing started");
+                }
                 server_handle_edge_crossing(cmd_msg);
                 cmd_count++;
                 if (cmd_count >= 64) break;
+            }
+            if (cmd_count > 0) {
+                LOG_INFO("Server command processing done (count=%d)", cmd_count);
             }
 
             /* Process broadcast queue (drain messages queued by hooks) */
@@ -5379,6 +5392,13 @@ int main(int argc, char *argv[]) {
                 if (total_broadcast <= 5) {
                     LOG_INFO("QUEUE DEBUG #%d: sending msg to clients, client_count=%d",
                              total_broadcast, g_server.client_count);
+                }
+                if (strstr(queued_msg, "\"type\":\"active_monitor_changed\"")) {
+                    static int active_broadcast_log = 0;
+                    if (active_broadcast_log < 10) {
+                        active_broadcast_log++;
+                        LOG_INFO("Broadcasting active_monitor_changed #%d", active_broadcast_log);
+                    }
                 }
                 /* Send to all registered clients */
                 for (int i = 0; i < MAX_SERVER_CLIENTS; i++) {
