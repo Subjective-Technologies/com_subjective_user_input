@@ -4373,17 +4373,16 @@ static void handle_input_event(ClientState *client, JsonValue *msg) {
     const char *active_computer = json_get_string(msg, "active_computer_id", "");
     
     /* CLIPBOARD: Handle BEFORE is_for_me check - clipboard goes to ALL computers */
-#ifdef PLATFORM_LINUX
     if (strcmp(event_type, "clipboard_update") == 0) {
         const char *source = json_get_string(data, "source", "");
         const char *content = json_get_string(data, "content", "");
-        
+
         /* Don't update if this is our own clipboard update echoed back */
         if (strcmp(source, client->config.computer_id) == 0) {
             LOG_DEBUG("📋 Ignoring own clipboard echo");
             return;
         }
-        
+
         size_t content_len = strlen(content);
         if (content_len > 0 && content_len < CLIPBOARD_MAX_SIZE) {
             if (clipboard_set(content, content_len)) {
@@ -4397,7 +4396,6 @@ static void handle_input_event(ClientState *client, JsonValue *msg) {
         }
         return;  /* Clipboard handled, don't process as regular input */
     }
-#endif
     
     /* Only execute if this computer is active */
     bool is_for_me = (strcmp(active_computer, client->config.computer_id) == 0);
