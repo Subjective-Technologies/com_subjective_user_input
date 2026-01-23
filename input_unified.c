@@ -97,7 +97,6 @@
     #include <ws2tcpip.h>
     #include <process.h>
     #include <io.h>
-    #include <direct.h>
     #include <pthread.h>  /* pthreads4w from vcpkg */
     #pragma comment(lib, "ws2_32.lib")
     #pragma comment(lib, "user32.lib")
@@ -176,6 +175,7 @@ typedef struct {
     char role[16];  /* "main" or "player" */
     int port;
     bool use_ssl;
+    bool local_server;  /* Start embedded Python server */
     LogLevel log_level;
 } ClientConfig;
 
@@ -249,7 +249,16 @@ typedef struct {
     pthread_t input_thread;
     bool input_thread_running;
 #endif
-
+    
+    /* Server process (for --local-server mode) */
+#ifdef PLATFORM_LINUX
+    pid_t server_pid;
+#endif
+#ifdef PLATFORM_WINDOWS
+    HANDLE server_process;
+    DWORD server_pid;
+#endif
+    
     /* Clipboard sharing */
     char last_clipboard[65536];  /* Last known clipboard content (max 64KB) */
     size_t last_clipboard_len;
@@ -267,52 +276,6 @@ typedef struct {
 #endif
     
 } ClientState;
-
-/* ============================================================================
- * Embedded Server State (for --role main server mode)
- * ============================================================================ */
-
-#define MAX_SERVER_CLIENTS 16
-
-/* Per-client session data for server mode */
-typedef struct {
-    char computer_id[MAX_HOSTNAME];
-    char role[16];  /* "main" or "player" */
-    Monitor monitors[MAX_MONITORS];
-    int monitor_count;
-    bool registered;
-    struct lws *wsi;
-    /* Receive buffer */
-    char rx_buffer[MAX_MESSAGE_SIZE];
-    size_t rx_len;
-} ServerClient;
-
-/* Server state */
-typedef struct {
-    bool running;
-    bool is_server_mode;  /* true if running as embedded server */
-    int port;
-    struct lws_context *ws_context;
-
-    /* Connected clients */
-    ServerClient clients[MAX_SERVER_CLIENTS];
-    int client_count;
-    pthread_mutex_t clients_mutex;
-
-    /* Active computer tracking */
-    char active_computer_id[MAX_HOSTNAME];
-    char active_monitor_id[32];
-    double cursor_x;
-    double cursor_y;
-
-    /* Edge crossing debounce */
-    double last_edge_crossing_time;
-    char last_crossed_from_computer[MAX_HOSTNAME];
-    char last_crossed_from_monitor[32];
-} ServerState;
-
-/* Global server state */
-static ServerState g_server = {0};
 
 /* Global client state (needed for callbacks) */
 static ClientState g_client;
@@ -351,108 +314,31 @@ static void log_message(LogLevel level, const char *fmt, ...) {
     /* Log to file if available */
     if (g_logger.log_file) {
         fprintf(g_logger.log_file, "%s - %s - %s\n", timestamp, log_level_str[level], message);
-        fflush(g_logger.log_file);  /* Flush immediately for sync */
+        fflush(g_logger.log_file);  /* Flush immediately for Dropbox sync */
     }
 }
 
-/* Load .env file from executable directory */
-static void load_env_file(void) {
-    FILE *env_file = NULL;
-    char env_path[512];
-    char line[1024];
-
-    /* Try .env in current directory first */
-    env_file = fopen(".env", "r");
-    if (!env_file) {
-        /* Try in executable directory */
-#ifdef PLATFORM_WINDOWS
-        char exe_path[512];
-        if (GetModuleFileNameA(NULL, exe_path, sizeof(exe_path)) > 0) {
-            /* Remove executable name to get directory */
-            char *last_slash = strrchr(exe_path, '\\');
-            if (last_slash) {
-                *last_slash = '\0';
-                snprintf(env_path, sizeof(env_path), "%s\\.env", exe_path);
-                env_file = fopen(env_path, "r");
-            }
-        }
-#else
-        /* Try ../. env or ./.env */
-        env_file = fopen("../.env", "r");
-#endif
-    }
-
-    if (!env_file) {
-        return;  /* No .env file found, use defaults */
-    }
-
-    fprintf(stderr, "Loading .env file...\n");
-
-    while (fgets(line, sizeof(line), env_file)) {
-        /* Skip comments and empty lines */
-        char *trimmed = line;
-        while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
-        if (*trimmed == '#' || *trimmed == '\n' || *trimmed == '\0') continue;
-
-        /* Remove trailing newline */
-        char *newline = strchr(trimmed, '\n');
-        if (newline) *newline = '\0';
-        char *cr = strchr(trimmed, '\r');
-        if (cr) *cr = '\0';
-
-        /* Parse KEY=VALUE */
-        char *equals = strchr(trimmed, '=');
-        if (!equals) continue;
-
-        *equals = '\0';
-        char *key = trimmed;
-        char *value = equals + 1;
-
-        /* Remove quotes from value if present */
-        if (*value == '"' || *value == '\'') {
-            char quote = *value;
-            value++;
-            char *end_quote = strrchr(value, quote);
-            if (end_quote) *end_quote = '\0';
-        }
-
-        /* Set environment variable (don't override existing) */
-        if (!getenv(key)) {
-#ifdef PLATFORM_WINDOWS
-            char env_str[1024];
-            snprintf(env_str, sizeof(env_str), "%s=%s", key, value);
-            _putenv(env_str);
-#else
-            setenv(key, value, 0);
-#endif
-            fprintf(stderr, "  Set %s=%s\n", key, value);
-        }
-    }
-
-    fclose(env_file);
-}
-
-static int init_logging(const char *computer_name, const char *role) {
-
-    /* Get timestamp in format YYYY_MM_DD_HH_MM_SS */
+static int init_logging(const char *computer_name) {
+    
+    /* Get timestamp */
     time_t now;
     struct tm *tm_info;
     char timestamp[32];
     time(&now);
     tm_info = localtime(&now);
-    strftime(timestamp, sizeof(timestamp), "%Y_%m_%d_%H_%M_%S", tm_info);
+    strftime(timestamp, sizeof(timestamp), "%Y%m%d%H%M%S", tm_info);
     
-    /* Get logs directory from environment variable (can be set via .env file) */
+    /* Get logs directory from environment variable, default to "logs" */
     struct stat st;
     char log_dir[512];
     const char *env_logs_path = getenv("LOGS_FOLDER_PATH");
-
+    
     if (env_logs_path && strlen(env_logs_path) > 0) {
         /* Use environment variable if set */
         strncpy(log_dir, env_logs_path, sizeof(log_dir) - 1);
-        log_dir[sizeof(log_dir) - 1] = '\0';
+        log_dir[sizeof(log_dir) - 1] = '\0';  /* Ensure null termination */
     } else {
-        /* Default to "logs" in current directory */
+        /* Default to "logs" */
         strncpy(log_dir, "logs", sizeof(log_dir) - 1);
         log_dir[sizeof(log_dir) - 1] = '\0';
     }
@@ -468,25 +354,17 @@ static int init_logging(const char *computer_name, const char *role) {
                 log_dir[sizeof(log_dir) - 1] = '\0';  /* Ensure null termination */
             } else {
                 /* Create logs directory */
-#ifdef PLATFORM_WINDOWS
-                _mkdir(log_dir);
-#else
                 mkdir(log_dir, 0755);
-#endif
             }
         } else {
             /* Environment variable path specified, create it if it doesn't exist */
-#ifdef PLATFORM_WINDOWS
-            _mkdir(log_dir);
-#else
             mkdir(log_dir, 0755);
-#endif
         }
     }
     
-    /* Generate log filename: YYYY_MM_DD_HH_MM_SS_virtualglass_input-[role]-[pc_name].log */
+    /* Generate log filename */
     snprintf(g_logger.log_filename, sizeof(g_logger.log_filename),
-             "%s/%s_virtualglass_input-%s-%s.log", log_dir, timestamp, role, computer_name);
+             "%s/input_unified_%s_%s.log", log_dir, computer_name, timestamp);
     
     /* Open log file */
     g_logger.log_file = fopen(g_logger.log_filename, "a");
@@ -1811,7 +1689,6 @@ static bool clipboard_set(const char *content, size_t len) {
 /* Forward declaration */
 static void send_input_event(ClientState *client, const char *event_type, 
                              const char *json_data);
-static void* clipboard_monitor_thread(void *arg);
 
 /* Clipboard monitor thread */
 static void* clipboard_monitor_thread(void *arg) {
@@ -2583,11 +2460,9 @@ static void inject_mouse_scroll_windows(int dx, int dy) {
  * Windows Input Capture (Low-Level Hooks)
  * ============================================================================ */
 
-/* Forward declarations */
-static void send_input_event(ClientState *client, const char *event_type,
+/* Forward declaration */
+static void send_input_event(ClientState *client, const char *event_type, 
                              const char *json_data);
-static void send_edge_crossing_request(ClientState *client, const char *edge,
-                                       float position, int cursor_x, int cursor_y);
 
 /* Windows low-level keyboard hook */
 static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
@@ -2700,44 +2575,7 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
                 last_x = pt.x;
                 last_y = pt.y;
                 hook_send_count++;
-
-                /* Edge detection for screen boundary crossing */
-                int screen_w = (g_client.monitor_count > 0) ? g_client.monitors[0].width : 1920;
-                int screen_h = (g_client.monitor_count > 0) ? g_client.monitors[0].height : 1080;
-                bool at_edge = (pt.x <= 5 || pt.x >= screen_w - 5 ||
-                               pt.y <= 5 || pt.y >= screen_h - 5);
-
-                /* Detect which edge and send edge crossing request if at edge and active */
-                if (at_edge && g_client.is_active) {
-                    const char *edge = NULL;
-                    float position = 0.0f;
-
-                    if (pt.x <= 5) {
-                        edge = "left";
-                        position = (float)pt.y / screen_h;
-                    } else if (pt.x >= screen_w - 5) {
-                        edge = "right";
-                        position = (float)pt.y / screen_h;
-                    } else if (pt.y <= 5) {
-                        edge = "top";
-                        position = (float)pt.x / screen_w;
-                    } else if (pt.y >= screen_h - 5) {
-                        edge = "bottom";
-                        position = (float)pt.x / screen_w;
-                    }
-
-                    if (edge) {
-                        /* Throttle edge crossing requests to max once per 200ms */
-                        static double last_edge_request_time = 0;
-                        if (now - last_edge_request_time >= 200) {
-                            LOG_INFO("Edge detected: %s at (%.2f) cursor=(%d,%d) screen=%dx%d",
-                                     edge, position, pt.x, pt.y, screen_w, screen_h);
-                            send_edge_crossing_request(&g_client, edge, position, pt.x, pt.y);
-                            last_edge_request_time = now;
-                        }
-                    }
-                }
-
+                
                 /* Warn if hook is taking too long (could cause mouse lag) */
                 double total_time = get_time_ms() - hook_start;
                 if (total_time > 5.0) {
@@ -3046,468 +2884,6 @@ static int ws_callback(struct lws *wsi, enum lws_callback_reasons reason,
     return 0;
 }
 
-/* ============================================================================
- * Embedded WebSocket Server (for --role main without external server)
- * ============================================================================ */
-
-/* Find a client slot by WSI */
-static ServerClient* server_find_client_by_wsi(struct lws *wsi) {
-    for (int i = 0; i < MAX_SERVER_CLIENTS; i++) {
-        if (g_server.clients[i].wsi == wsi) {
-            return &g_server.clients[i];
-        }
-    }
-    return NULL;
-}
-
-/* Find a client by computer_id */
-static ServerClient* server_find_client_by_id(const char *computer_id) {
-    for (int i = 0; i < MAX_SERVER_CLIENTS; i++) {
-        if (g_server.clients[i].registered &&
-            strcmp(g_server.clients[i].computer_id, computer_id) == 0) {
-            return &g_server.clients[i];
-        }
-    }
-    return NULL;
-}
-
-/* Allocate a new client slot */
-static ServerClient* server_allocate_client(struct lws *wsi) {
-    for (int i = 0; i < MAX_SERVER_CLIENTS; i++) {
-        if (g_server.clients[i].wsi == NULL) {
-            memset(&g_server.clients[i], 0, sizeof(ServerClient));
-            g_server.clients[i].wsi = wsi;
-            g_server.client_count++;
-            return &g_server.clients[i];
-        }
-    }
-    return NULL;
-}
-
-/* Free a client slot */
-static void server_free_client(ServerClient *client) {
-    if (client) {
-        memset(client, 0, sizeof(ServerClient));
-        g_server.client_count--;
-    }
-}
-
-/* Send message to a specific client */
-static void server_send_to_client(ServerClient *client, const char *msg) {
-    if (!client || !client->wsi) return;
-
-    size_t len = strlen(msg);
-    unsigned char *buf = malloc(LWS_PRE + len + 1);
-    if (!buf) return;
-
-    memcpy(buf + LWS_PRE, msg, len);
-    lws_write(client->wsi, buf + LWS_PRE, len, LWS_WRITE_TEXT);
-    free(buf);
-}
-
-/* Broadcast message to all registered clients */
-static void server_broadcast(const char *msg) {
-    for (int i = 0; i < MAX_SERVER_CLIENTS; i++) {
-        if (g_server.clients[i].registered && g_server.clients[i].wsi) {
-            server_send_to_client(&g_server.clients[i], msg);
-        }
-    }
-}
-
-/* Broadcast message to all clients except one */
-static void server_broadcast_except(const char *msg, const char *except_computer_id) {
-    for (int i = 0; i < MAX_SERVER_CLIENTS; i++) {
-        if (g_server.clients[i].registered && g_server.clients[i].wsi) {
-            if (strcmp(g_server.clients[i].computer_id, except_computer_id) != 0) {
-                server_send_to_client(&g_server.clients[i], msg);
-            }
-        }
-    }
-}
-
-/* Handle registration message from client */
-static void server_handle_registration(ServerClient *client, const char *json_data) {
-    /* Parse computer_id */
-    const char *id_start = strstr(json_data, "\"computer_id\"");
-    if (id_start) {
-        id_start = strchr(id_start + 13, '"');
-        if (id_start) {
-            id_start++;
-            const char *id_end = strchr(id_start, '"');
-            if (id_end) {
-                size_t len = id_end - id_start;
-                if (len < MAX_HOSTNAME) {
-                    strncpy(client->computer_id, id_start, len);
-                    client->computer_id[len] = '\0';
-                }
-            }
-        }
-    }
-
-    /* Parse role (is_main) */
-    if (strstr(json_data, "\"is_main\":true") || strstr(json_data, "\"is_main\": true")) {
-        strcpy(client->role, "main");
-    } else if (strstr(json_data, "\"role\":\"main\"") || strstr(json_data, "\"role\": \"main\"")) {
-        strcpy(client->role, "main");
-    } else {
-        strcpy(client->role, "player");
-    }
-
-    /* Parse monitors */
-    const char *monitors_start = strstr(json_data, "\"monitors\"");
-    if (monitors_start) {
-        monitors_start = strchr(monitors_start, '[');
-        if (monitors_start) {
-            client->monitor_count = 0;
-            const char *mon_ptr = monitors_start;
-            while ((mon_ptr = strstr(mon_ptr, "\"monitor_id\"")) && client->monitor_count < MAX_MONITORS) {
-                Monitor *mon = &client->monitors[client->monitor_count];
-
-                /* Parse monitor_id */
-                const char *mid_start = strchr(mon_ptr + 12, '"');
-                if (mid_start) {
-                    mid_start++;
-                    const char *mid_end = strchr(mid_start, '"');
-                    if (mid_end) {
-                        size_t len = mid_end - mid_start;
-                        if (len < sizeof(mon->monitor_id)) {
-                            strncpy(mon->monitor_id, mid_start, len);
-                            mon->monitor_id[len] = '\0';
-                        }
-                    }
-                }
-
-                /* Parse width */
-                const char *w_start = strstr(mon_ptr, "\"width\"");
-                if (w_start) {
-                    w_start = strchr(w_start + 7, ':');
-                    if (w_start) mon->width = atoi(w_start + 1);
-                }
-
-                /* Parse height */
-                const char *h_start = strstr(mon_ptr, "\"height\"");
-                if (h_start) {
-                    h_start = strchr(h_start + 8, ':');
-                    if (h_start) mon->height = atoi(h_start + 1);
-                }
-
-                mon->x = 0;
-                mon->y = 0;
-                client->monitor_count++;
-                mon_ptr = mid_start ? mid_start : mon_ptr + 1;
-            }
-        }
-    }
-
-    client->registered = true;
-
-    /* If this is the first main client or first client overall, set as active */
-    if (g_server.active_computer_id[0] == '\0' || strcmp(client->role, "main") == 0) {
-        strncpy(g_server.active_computer_id, client->computer_id, MAX_HOSTNAME - 1);
-        strcpy(g_server.active_monitor_id, client->monitor_count > 0 ? client->monitors[0].monitor_id : "m0");
-        g_server.cursor_x = client->monitor_count > 0 ? client->monitors[0].width / 2.0 : 960;
-        g_server.cursor_y = client->monitor_count > 0 ? client->monitors[0].height / 2.0 : 540;
-    }
-
-    LOG_INFO("Server: Registered %s '%s' with %d monitors (active: %s:%s)",
-             client->role, client->computer_id, client->monitor_count,
-             g_server.active_computer_id, g_server.active_monitor_id);
-
-    /* Send registration acknowledgment */
-    char response[2048];
-    snprintf(response, sizeof(response),
-             "{\"type\":\"registration_success\",\"computer_id\":\"%s\",\"status\":\"success\","
-             "\"active_monitor\":{\"computer_id\":\"%s\",\"monitor_id\":\"%s\","
-             "\"cursor_x\":%.1f,\"cursor_y\":%.1f}}",
-             client->computer_id, g_server.active_computer_id, g_server.active_monitor_id,
-             g_server.cursor_x, g_server.cursor_y);
-    server_send_to_client(client, response);
-
-    /* Notify all clients of the active monitor */
-    char active_msg[512];
-    snprintf(active_msg, sizeof(active_msg),
-             "{\"type\":\"active_monitor_changed\",\"computer_id\":\"%s\",\"monitor_id\":\"%s\","
-             "\"cursor_x\":%.1f,\"cursor_y\":%.1f}",
-             g_server.active_computer_id, g_server.active_monitor_id,
-             g_server.cursor_x, g_server.cursor_y);
-    server_broadcast(active_msg);
-}
-
-/* Handle input event from client and route to active computer */
-static void server_handle_input_event(ServerClient *sender, const char *json_data) {
-    /* Parse event_type */
-    char event_type[32] = "";
-    const char *et_start = strstr(json_data, "\"event_type\"");
-    if (et_start) {
-        et_start = strchr(et_start + 12, '"');
-        if (et_start) {
-            et_start++;
-            const char *et_end = strchr(et_start, '"');
-            if (et_end && et_end - et_start < (int)sizeof(event_type)) {
-                strncpy(event_type, et_start, et_end - et_start);
-                event_type[et_end - et_start] = '\0';
-            }
-        }
-    }
-
-    /* Build forwarding message with active computer info */
-    char fwd_msg[MAX_MESSAGE_SIZE];
-    size_t json_len = strlen(json_data);
-
-    /* Find the last } in the JSON */
-    const char *last_brace = strrchr(json_data, '}');
-    if (last_brace && json_len < MAX_MESSAGE_SIZE - 200) {
-        size_t prefix_len = last_brace - json_data;
-        memcpy(fwd_msg, json_data, prefix_len);
-        snprintf(fwd_msg + prefix_len, sizeof(fwd_msg) - prefix_len,
-                 ",\"active_computer_id\":\"%s\",\"active_monitor_id\":\"%s\"}",
-                 g_server.active_computer_id, g_server.active_monitor_id);
-    } else {
-        strncpy(fwd_msg, json_data, sizeof(fwd_msg) - 1);
-    }
-
-    /* Broadcast to all clients - each client decides if it should execute */
-    server_broadcast(fwd_msg);
-}
-
-/* Handle edge crossing request */
-static void server_handle_edge_crossing(const char *json_data) {
-    /* Parse edge crossing parameters */
-    char computer_id[MAX_HOSTNAME] = "";
-    char monitor_id[32] = "";
-    char edge[16] = "";
-    double position = 0.5;
-
-    const char *cid = strstr(json_data, "\"computer_id\"");
-    if (cid) {
-        cid = strchr(cid + 13, '"');
-        if (cid) {
-            cid++;
-            const char *end = strchr(cid, '"');
-            if (end && end - cid < MAX_HOSTNAME) {
-                strncpy(computer_id, cid, end - cid);
-            }
-        }
-    }
-
-    const char *mid = strstr(json_data, "\"monitor_id\"");
-    if (mid) {
-        mid = strchr(mid + 12, '"');
-        if (mid) {
-            mid++;
-            const char *end = strchr(mid, '"');
-            if (end && end - mid < 32) {
-                strncpy(monitor_id, mid, end - mid);
-            }
-        }
-    }
-
-    const char *edg = strstr(json_data, "\"edge\"");
-    if (edg) {
-        edg = strchr(edg + 6, '"');
-        if (edg) {
-            edg++;
-            const char *end = strchr(edg, '"');
-            if (end && end - edg < 16) {
-                strncpy(edge, edg, end - edg);
-            }
-        }
-    }
-
-    const char *pos = strstr(json_data, "\"position\"");
-    if (pos) {
-        pos = strchr(pos + 10, ':');
-        if (pos) position = atof(pos + 1);
-    }
-
-    LOG_INFO("Server: Edge crossing request from %s:%s edge=%s pos=%.2f",
-             computer_id, monitor_id, edge, position);
-
-    /* Find target computer - simple logic: cycle through registered players */
-    ServerClient *target = NULL;
-
-    /* Find a different registered client to switch to */
-    for (int i = 0; i < MAX_SERVER_CLIENTS; i++) {
-        if (g_server.clients[i].registered &&
-            strcmp(g_server.clients[i].computer_id, g_server.active_computer_id) != 0) {
-            target = &g_server.clients[i];
-            break;
-        }
-    }
-
-    if (!target) {
-        LOG_INFO("Server: No other computer to switch to");
-        return;
-    }
-
-    /* Update active computer */
-    strncpy(g_server.active_computer_id, target->computer_id, MAX_HOSTNAME - 1);
-    strcpy(g_server.active_monitor_id, target->monitor_count > 0 ? target->monitors[0].monitor_id : "m0");
-
-    /* Calculate cursor position on target */
-    double new_x = 100, new_y = 100;  /* Default offset from edge */
-    if (target->monitor_count > 0) {
-        Monitor *mon = &target->monitors[0];
-        if (strcmp(edge, "right") == 0) {
-            new_x = 50;  /* Enter from left */
-            new_y = position * mon->height;
-        } else if (strcmp(edge, "left") == 0) {
-            new_x = mon->width - 50;  /* Enter from right */
-            new_y = position * mon->height;
-        } else if (strcmp(edge, "bottom") == 0) {
-            new_x = position * mon->width;
-            new_y = 50;  /* Enter from top */
-        } else if (strcmp(edge, "top") == 0) {
-            new_x = position * mon->width;
-            new_y = mon->height - 50;  /* Enter from bottom */
-        }
-    }
-
-    g_server.cursor_x = new_x;
-    g_server.cursor_y = new_y;
-
-    LOG_INFO("Server: Switched active to %s:%s cursor=(%.1f, %.1f)",
-             g_server.active_computer_id, g_server.active_monitor_id, new_x, new_y);
-
-    /* Broadcast active monitor change to all clients */
-    char msg[512];
-    snprintf(msg, sizeof(msg),
-             "{\"type\":\"active_monitor_changed\",\"computer_id\":\"%s\",\"monitor_id\":\"%s\","
-             "\"cursor_x\":%.1f,\"cursor_y\":%.1f}",
-             g_server.active_computer_id, g_server.active_monitor_id, new_x, new_y);
-    server_broadcast(msg);
-}
-
-/* Handle message from client */
-static void server_handle_message(ServerClient *client, const char *json_data, size_t len) {
-    UNUSED(len);
-
-    /* Determine message type */
-    if (strstr(json_data, "\"type\":\"register_device\"") ||
-        strstr(json_data, "\"type\": \"register_device\"")) {
-        server_handle_registration(client, json_data);
-    } else if (strstr(json_data, "\"type\":\"input_event\"") ||
-               strstr(json_data, "\"type\": \"input_event\"")) {
-        server_handle_input_event(client, json_data);
-    } else if (strstr(json_data, "\"type\":\"edge_crossing_request\"") ||
-               strstr(json_data, "\"type\": \"edge_crossing_request\"")) {
-        server_handle_edge_crossing(json_data);
-    } else if (strstr(json_data, "\"type\":\"ping\"")) {
-        server_send_to_client(client, "{\"type\":\"pong\"}");
-    } else {
-        LOG_DEBUG("Server: Unknown message type: %.100s", json_data);
-    }
-}
-
-/* Server WebSocket callback */
-static int server_ws_callback(struct lws *wsi, enum lws_callback_reasons reason,
-                               void *user, void *in, size_t len) {
-    ServerClient *client = (ServerClient *)user;
-
-    switch (reason) {
-        case LWS_CALLBACK_ESTABLISHED:
-            LOG_INFO("Server: New connection");
-            if (!client) {
-                client = server_allocate_client(wsi);
-                if (!client) {
-                    LOG_ERROR("Server: Max clients reached");
-                    return -1;
-                }
-            }
-            client->wsi = wsi;
-            break;
-
-        case LWS_CALLBACK_RECEIVE:
-            if (!client) {
-                client = server_find_client_by_wsi(wsi);
-            }
-            if (client && len > 0 && in) {
-                if (client->rx_len + len < MAX_MESSAGE_SIZE) {
-                    memcpy(client->rx_buffer + client->rx_len, in, len);
-                    client->rx_len += len;
-                }
-                if (lws_is_final_fragment(wsi)) {
-                    client->rx_buffer[client->rx_len] = '\0';
-                    server_handle_message(client, client->rx_buffer, client->rx_len);
-                    client->rx_len = 0;
-                }
-            }
-            break;
-
-        case LWS_CALLBACK_CLOSED:
-            LOG_INFO("Server: Connection closed");
-            if (!client) {
-                client = server_find_client_by_wsi(wsi);
-            }
-            if (client) {
-                if (client->registered) {
-                    LOG_INFO("Server: Client '%s' disconnected", client->computer_id);
-
-                    /* If active computer disconnected, switch to another */
-                    if (strcmp(client->computer_id, g_server.active_computer_id) == 0) {
-                        g_server.active_computer_id[0] = '\0';
-                        for (int i = 0; i < MAX_SERVER_CLIENTS; i++) {
-                            if (g_server.clients[i].registered &&
-                                g_server.clients[i].wsi != wsi) {
-                                strncpy(g_server.active_computer_id,
-                                        g_server.clients[i].computer_id, MAX_HOSTNAME - 1);
-                                strcpy(g_server.active_monitor_id,
-                                       g_server.clients[i].monitor_count > 0 ?
-                                       g_server.clients[i].monitors[0].monitor_id : "m0");
-                                LOG_INFO("Server: Switched active to %s", g_server.active_computer_id);
-                                break;
-                            }
-                        }
-                    }
-                }
-                server_free_client(client);
-            }
-            break;
-
-        default:
-            break;
-    }
-
-    return 0;
-}
-
-/* Server protocols */
-static struct lws_protocols server_protocols[] = {
-    {
-        "kvm-protocol",
-        server_ws_callback,
-        sizeof(ServerClient),
-        MAX_MESSAGE_SIZE,
-        0, NULL, 0
-    },
-    { NULL, NULL, 0, 0, 0, NULL, 0 }
-};
-
-/* Start embedded WebSocket server */
-static int start_embedded_server(int port) {
-    struct lws_context_creation_info info;
-    memset(&info, 0, sizeof(info));
-
-    info.port = port;
-    info.protocols = server_protocols;
-    info.gid = -1;
-    info.uid = -1;
-    info.options = LWS_SERVER_OPTION_VALIDATE_UTF8;
-
-    g_server.ws_context = lws_create_context(&info);
-    if (!g_server.ws_context) {
-        LOG_ERROR("Failed to create server context");
-        return -1;
-    }
-
-    g_server.port = port;
-    g_server.running = true;
-    g_server.is_server_mode = true;
-
-    LOG_INFO("Embedded WebSocket server started on port %d", port);
-    return 0;
-}
-
 /* Protocol list */
 static struct lws_protocols protocols[] = {
     {
@@ -3540,8 +2916,7 @@ static void queue_ws_message(ClientState *client, const char *msg) {
 /* Send edge crossing request to server */
 static void send_edge_crossing_request(ClientState *client, const char *edge,
                                        float position, int cursor_x, int cursor_y) {
-    if (!client->running) return;
-    if (!g_server.is_server_mode && !client->connected) return;
+    if (!client->running || !client->connected) return;
     
     /* Only send from main computer when active */
     if (strcmp(client->config.role, "main") != 0 || !client->is_active) return;
@@ -3561,15 +2936,9 @@ static void send_edge_crossing_request(ClientState *client, const char *edge,
         "\"cursor_y\":%d}",
         client->config.computer_id, monitor_id, edge, position, cursor_x, cursor_y);
     
-    /* In server mode, handle edge crossing directly */
-    if (g_server.is_server_mode) {
-        server_handle_edge_crossing(json_msg);
-        return;
-    }
-
     char *msg = strdup(json_msg);
     if (!msg) return;
-
+    
     if (!msg_queue_push(&client->msg_queue, msg)) {
         LOG_WARN("Message queue full, dropping edge crossing request");
         free(msg);
@@ -3584,9 +2953,7 @@ static void send_edge_crossing_request(ClientState *client, const char *edge,
 static void send_input_event(ClientState *client, const char *event_type,
                              const char *json_data) {
     /* Fast path: Return immediately if not ready */
-    /* In server mode, we don't need client->connected */
-    if (!client->running) return;
-    if (!g_server.is_server_mode && !client->connected) return;
+    if (!client->running || !client->connected) return;
     
     /* Track performance for mouse moves (most frequent event) */
     static double last_perf_log_send = 0;
@@ -3619,39 +2986,7 @@ static void send_input_event(ClientState *client, const char *event_type,
         return;
     }
     
-    /* In server mode, broadcast directly to connected clients */
-    if (g_server.is_server_mode) {
-        /* Build full message with active computer info */
-        char full_msg[MAX_MESSAGE_SIZE];
-        size_t msg_len = strlen(msg);
-        /* Find last } to insert active computer info */
-        const char *last_brace = strrchr(msg, '}');
-        if (last_brace && msg_len < MAX_MESSAGE_SIZE - 200) {
-            size_t prefix_len = last_brace - msg;
-            memcpy(full_msg, msg, prefix_len);
-            snprintf(full_msg + prefix_len, sizeof(full_msg) - prefix_len,
-                     ",\"active_computer_id\":\"%s\",\"active_monitor_id\":\"%s\"}",
-                     g_server.active_computer_id, g_server.active_monitor_id);
-        } else {
-            strncpy(full_msg, msg, sizeof(full_msg) - 1);
-            full_msg[sizeof(full_msg) - 1] = '\0';
-        }
-
-        /* Debug: log occasional broadcasts */
-        static int broadcast_count = 0;
-        broadcast_count++;
-        if (broadcast_count <= 5 || broadcast_count % 500 == 0) {
-            LOG_DEBUG("Server broadcast #%d: %s to active=%s:%s",
-                     broadcast_count, event_type,
-                     g_server.active_computer_id, g_server.active_monitor_id);
-        }
-
-        server_broadcast(full_msg);
-        free(msg);
-        return;
-    }
-
-    /* Client mode: Use thread-safe queue for input events */
+    /* Use thread-safe queue for input events from capture thread */
     if (!msg_queue_push(&client->msg_queue, msg)) {
         static int overflow_count = 0;
         overflow_count++;
@@ -3665,11 +3000,11 @@ static void send_input_event(ClientState *client, const char *event_type,
             send_count++;
             double send_duration = get_time_ms() - send_start;
             send_total_time += send_duration;
-
+            
             if (send_duration > 2.0) {
                 LOG_WARN("⚠️ send_input_event took %.2fms for mouse_move", send_duration);
             }
-
+            
             if (current_time - last_perf_log_send >= 10000) {
                 double avg_time = send_count > 0 ? send_total_time / send_count : 0;
                 LOG_INFO("📤 send_input_event perf: count=%d, avg=%.3fms",
@@ -3679,14 +3014,15 @@ static void send_input_event(ClientState *client, const char *event_type,
                 last_perf_log_send = current_time;
             }
         }
-
+        
         /* CRITICAL: Use lws_cancel_service to wake up main loop from capture thread
          * lws_callback_on_writable is NOT thread-safe and causes delays! */
         if (client->ws_context) {
             lws_cancel_service(client->ws_context);
         }
-        free(msg);
     }
+    
+    free(msg);
 }
 
 /* ============================================================================
@@ -4495,9 +3831,15 @@ static int client_init(ClientState *client) {
     client->config.log_level = LOG_INFO;
     client->config.port = 8765;
     client->config.use_ssl = false;
+    client->config.local_server = false;
     strcpy(client->config.role, "player");
-
+    
+#ifdef PLATFORM_LINUX
+    client->server_pid = 0;
+#endif
 #ifdef PLATFORM_WINDOWS
+    client->server_process = NULL;
+    client->server_pid = 0;
     client->keyboard_hook = NULL;
     client->mouse_hook = NULL;
 #endif
@@ -4779,6 +4121,159 @@ static char* get_local_ip(void) {
     close(sock);
     return ip;
 }
+
+static void kill_process_on_port(int port) {
+    char cmd[256];
+    FILE *fp;
+    
+    /* Try lsof */
+    snprintf(cmd, sizeof(cmd), "lsof -ti :%d 2>/dev/null", port);
+    fp = popen(cmd, "r");
+    if (fp) {
+        char pid_str[32];
+        if (fgets(pid_str, sizeof(pid_str), fp)) {
+            pid_t pid = (pid_t)atoi(pid_str);
+            if (pid > 0) {
+                LOG_INFO("Found process %d on port %d, killing...", pid, port);
+                kill(pid, SIGTERM);
+                sleep_ms(500);
+                /* Check if still running, force kill */
+                if (kill(pid, 0) == 0) {
+                    LOG_INFO("Force killing process %d", pid);
+                    kill(pid, SIGKILL);
+                }
+            }
+        }
+        pclose(fp);
+    }
+}
+
+static int start_local_server(int port, pid_t *server_pid) {
+    char script_path[512];
+    char python_path[512];
+    char cwd[512];
+    
+    /* Get current working directory */
+    if (!getcwd(cwd, sizeof(cwd))) {
+        LOG_ERROR("Cannot get current directory");
+        return -1;
+    }
+    
+    /* Go up one level from cinput/ to project root */
+    char *last_slash = strrchr(cwd, '/');
+    if (last_slash && strcmp(last_slash + 1, "cinput") == 0) {
+        *last_slash = '\0';
+    }
+    
+    /* Find server script */
+    int ret = snprintf(script_path, sizeof(script_path), "%s/input_server.py", cwd);
+    if (ret < 0 || (size_t)ret >= sizeof(script_path)) {
+        LOG_ERROR("Path too long for script_path buffer");
+        return -1;
+    }
+    if (access(script_path, R_OK) != 0) {
+        LOG_ERROR("Server script not found: %s", script_path);
+        return -1;
+    }
+    
+    /* Find Python executable */
+    ret = snprintf(python_path, sizeof(python_path), "%s/myenv/bin/python3", cwd);
+    if (ret < 0 || (size_t)ret >= sizeof(python_path)) {
+        LOG_ERROR("Path too long for python_path buffer");
+        return -1;
+    }
+    if (access(python_path, X_OK) != 0) {
+        strcpy(python_path, "python3");  /* Fallback to system Python */
+        LOG_INFO("Using system Python: %s", python_path);
+    } else {
+        LOG_INFO("Using venv Python: %s", python_path);
+    }
+    
+    /* Kill any existing process on the port */
+    kill_process_on_port(port);
+    sleep_ms(500);
+    
+    /* Generate timestamp for log file (before fork so both processes can use it) */
+    char timestamp[32];
+    time_t now;
+    struct tm *tm_info;
+    time(&now);
+    tm_info = localtime(&now);
+    strftime(timestamp, sizeof(timestamp), "%Y%m%d%H%M%S", tm_info);
+    
+    /* Ensure logs directory exists */
+    char logs_dir[1024];
+    ret = snprintf(logs_dir, sizeof(logs_dir), "%s/logs", cwd);
+    if (ret < 0 || (size_t)ret >= sizeof(logs_dir)) {
+        LOG_ERROR("Path too long for logs_dir buffer");
+        return -1;
+    }
+    struct stat st;
+    if (stat(logs_dir, &st) != 0) {
+        mkdir(logs_dir, 0755);
+    }
+    
+    /* Build server log file path */
+    char server_log_path[1024];
+    ret = snprintf(server_log_path, sizeof(server_log_path), 
+                   "%s/input_server_%s_%s.log", logs_dir, g_client.config.computer_id, timestamp);
+    if (ret < 0 || (size_t)ret >= sizeof(server_log_path)) {
+        LOG_ERROR("Path too long for server_log_path buffer");
+        return -1;
+    }
+    
+    /* Start server as background process */
+    pid_t pid = fork();
+    if (pid < 0) {
+        LOG_ERROR("Failed to fork server process");
+        return -1;
+    }
+    
+    if (pid == 0) {
+        /* Child process: exec server */
+        char port_str[16];
+        snprintf(port_str, sizeof(port_str), "%d", port);
+        
+        /* Redirect stdout and stderr to log file */
+        int log_fd = open(server_log_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (log_fd >= 0) {
+            dup2(log_fd, STDOUT_FILENO);
+            dup2(log_fd, STDERR_FILENO);
+            close(log_fd);
+        } else {
+            /* Fallback to /dev/null if log file can't be opened */
+            int devnull = open("/dev/null", O_WRONLY);
+            if (devnull >= 0) {
+                dup2(devnull, STDOUT_FILENO);
+                dup2(devnull, STDERR_FILENO);
+                close(devnull);
+            }
+        }
+        
+        execlp(python_path, python_path, script_path, 
+               "--port", port_str, "--no-ssl", (char*)NULL);
+        
+        /* Should not reach here */
+        exit(1);
+    }
+    
+    /* Parent process */
+    *server_pid = pid;
+    LOG_INFO("Started server process (PID: %d)", pid);
+    LOG_INFO("Server logs: %s", server_log_path);
+    
+    /* Wait a moment for server to start */
+    sleep_ms(2000);
+    
+    /* Check if process is still running */
+    if (kill(pid, 0) != 0) {
+        LOG_ERROR("Server process died immediately");
+        *server_pid = 0;
+        return -1;
+    }
+    
+    return 0;
+}
 #endif
 
 #ifdef PLATFORM_WINDOWS
@@ -4814,39 +4309,271 @@ static char* get_local_ip(void) {
     WSACleanup();
     return ip;
 }
+
+static void kill_process_on_port(int port) {
+    char cmd[512];
+    FILE *fp;
+    
+    /* Use netstat to find process using the port */
+    snprintf(cmd, sizeof(cmd), "netstat -ano | findstr \":%d\"", port);
+    fp = _popen(cmd, "r");
+    if (fp) {
+        char line[256];
+        while (fgets(line, sizeof(line), fp)) {
+            /* Parse PID from netstat output */
+            char *pid_str = strrchr(line, ' ');
+            if (pid_str) {
+                pid_str++;  /* Skip space */
+                DWORD pid = (DWORD)atoi(pid_str);
+                if (pid > 0) {
+                    LOG_INFO("Found process %lu on port %d, killing...", pid, port);
+                    HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+                    if (hProcess) {
+                        TerminateProcess(hProcess, 0);
+                        CloseHandle(hProcess);
+                        Sleep(500);
+                        /* Check if still running, force kill */
+                        hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+                        if (hProcess) {
+                            LOG_INFO("Force killing process %lu", pid);
+                            TerminateProcess(hProcess, 1);
+                            CloseHandle(hProcess);
+                        }
+                    }
+                }
+            }
+        }
+        _pclose(fp);
+    }
+}
+
+static int start_local_server(int port, HANDLE *server_process, DWORD *server_pid) {
+    char script_path[MAX_PATH];
+    char python_path[MAX_PATH];
+    char cwd[MAX_PATH];
+    char command_line[1024];
+    STARTUPINFOA si = {0};
+    PROCESS_INFORMATION pi = {0};
+    
+    /* Get current working directory */
+    if (!GetCurrentDirectoryA(sizeof(cwd), cwd)) {
+        LOG_ERROR("Cannot get current directory");
+        return -1;
+    }
+    
+    /* Go up one level from cinput\ to project root */
+    char *last_slash = strrchr(cwd, '\\');
+    if (last_slash && _stricmp(last_slash + 1, "cinput") == 0) {
+        *last_slash = '\0';
+    }
+    
+    /* Find server script */
+    int ret = snprintf(script_path, sizeof(script_path), "%s\\input_server.py", cwd);
+    if (ret < 0 || (size_t)ret >= sizeof(script_path)) {
+        LOG_ERROR("Path too long for script_path buffer");
+        return -1;
+    }
+    if (_access(script_path, 0) != 0) {
+        LOG_ERROR("Server script not found: %s", script_path);
+        return -1;
+    }
+    
+    /* Find Python executable */
+    ret = snprintf(python_path, sizeof(python_path), "%s\\myenv_windows\\Scripts\\python.exe", cwd);
+    if (ret < 0 || (size_t)ret >= sizeof(python_path)) {
+        LOG_ERROR("Path too long for python_path buffer");
+        return -1;
+    }
+    if (_access(python_path, 0) != 0) {
+        strcpy(python_path, "python.exe");  /* Fallback to system Python */
+        LOG_INFO("Using system Python: %s", python_path);
+    } else {
+        LOG_INFO("Using venv Python: %s", python_path);
+    }
+    
+    /* Kill any existing process on the port */
+    kill_process_on_port(port);
+    Sleep(500);
+    
+    /* Build command line */
+    char port_str[16];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+    snprintf(command_line, sizeof(command_line), "\"%s\" \"%s\" --port %s --no-ssl",
+             python_path, script_path, port_str);
+    
+    /* Setup process creation */
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+    
+    /* Create process */
+    if (!CreateProcessA(
+            NULL,           /* Application name (use command line) */
+            command_line,   /* Command line */
+            NULL,           /* Process security attributes */
+            NULL,           /* Thread security attributes */
+            FALSE,          /* Inherit handles */
+            CREATE_NO_WINDOW | DETACHED_PROCESS,  /* Creation flags */
+            NULL,           /* Environment */
+            cwd,            /* Current directory */
+            &si,            /* Startup info */
+            &pi)) {         /* Process information */
+        LOG_ERROR("Failed to create server process: %lu", GetLastError());
+        return -1;
+    }
+    
+    /* Store process handle and PID */
+    *server_process = pi.hProcess;
+    *server_pid = pi.dwProcessId;
+    CloseHandle(pi.hThread);  /* We don't need the thread handle */
+    
+    LOG_INFO("Started server process (PID: %lu)", pi.dwProcessId);
+    
+    /* Wait for server to start and verify it's listening on the port */
+    LOG_INFO("Waiting for server to start...");
+    int max_wait = 10;  /* Wait up to 10 seconds */
+    bool server_ready = false;
+    
+    for (int i = 0; i < max_wait; i++) {
+        Sleep(1000);
+        
+        /* Check if process is still running */
+        DWORD exit_code;
+        if (GetExitCodeProcess(pi.hProcess, &exit_code)) {
+            if (exit_code != STILL_ACTIVE) {
+                LOG_ERROR("Server process died (exit code: %lu)", exit_code);
+                CloseHandle(pi.hProcess);
+                *server_process = NULL;
+                *server_pid = 0;
+                return -1;
+            }
+        }
+        
+        /* Try to connect to the server port to verify it's ready */
+        WSADATA wsaData;
+        if (WSAStartup(MAKEWORD(2, 2), &wsaData) == 0) {
+            SOCKET test_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (test_sock != INVALID_SOCKET) {
+                struct sockaddr_in addr;
+                addr.sin_family = AF_INET;
+                addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+                addr.sin_port = htons(port);
+                
+                /* Try blocking connect with short timeout using select */
+                u_long mode = 1;
+                ioctlsocket(test_sock, FIONBIO, &mode);
+                
+                int connect_result = connect(test_sock, (struct sockaddr*)&addr, sizeof(addr));
+                int last_error = WSAGetLastError();
+                
+                if (connect_result == 0) {
+                    /* Connected immediately */
+                    closesocket(test_sock);
+                    WSACleanup();
+                    server_ready = true;
+                    LOG_INFO("Server is ready and listening on port %d", port);
+                    break;
+                } else if (last_error == WSAEWOULDBLOCK) {
+                    /* Connection in progress - wait for it */
+                    fd_set write_fds, error_fds;
+                    struct timeval tv;
+                    FD_ZERO(&write_fds);
+                    FD_ZERO(&error_fds);
+                    FD_SET(test_sock, &write_fds);
+                    FD_SET(test_sock, &error_fds);
+                    tv.tv_sec = 0;
+                    tv.tv_usec = 200000;  /* 200ms timeout */
+                    
+                    int select_result = select(0, NULL, &write_fds, &error_fds, &tv);
+                    if (select_result > 0 && FD_ISSET(test_sock, &write_fds)) {
+                        /* Connection succeeded */
+                        closesocket(test_sock);
+                        WSACleanup();
+                        server_ready = true;
+                        LOG_INFO("Server is ready and listening on port %d", port);
+                        break;
+                    }
+                }
+                closesocket(test_sock);
+            }
+            WSACleanup();
+        }
+        
+        if (i < max_wait - 1) {
+            LOG_INFO("Server not ready yet, waiting... (%d/%d)", i + 1, max_wait);
+        }
+    }
+    
+    if (!server_ready) {
+        LOG_WARN("Server TCP port check failed, but continuing anyway...");
+        LOG_WARN("WebSocket connection may fail - server may need more time to initialize");
+    } else {
+        /* Give server more time for WebSocket handler initialization */
+        /* Python server needs time to import modules and set up WebSocket handlers */
+        LOG_INFO("Server TCP port is open, waiting 2 seconds for WebSocket handler to fully initialize...");
+        Sleep(2000);
+        LOG_INFO("Proceeding with WebSocket connection attempt...");
+    }
+    
+    return 0;
+}
 #endif
 
 static void signal_handler(int sig) {
     LOG_INFO("Signal %d received, shutting down...", sig);
     g_shutdown = 1;
     g_client.running = false;
-    g_server.running = false;
+    
+#ifdef PLATFORM_LINUX
+    /* Stop server process if running */
+    if (g_client.server_pid > 0) {
+        LOG_INFO("Stopping server process (PID: %d)...", g_client.server_pid);
+        kill(g_client.server_pid, SIGTERM);
+        sleep_ms(1000);
+        if (kill(g_client.server_pid, 0) == 0) {
+            kill(g_client.server_pid, SIGKILL);
+        }
+        g_client.server_pid = 0;
+    }
+#endif
+#ifdef PLATFORM_WINDOWS
+    /* Stop server process if running */
+    if (g_client.server_process != NULL) {
+        LOG_INFO("Stopping server process (PID: %lu)...", g_client.server_pid);
+        TerminateProcess(g_client.server_process, 0);
+        Sleep(1000);
+        DWORD exit_code;
+        if (GetExitCodeProcess(g_client.server_process, &exit_code) && exit_code == STILL_ACTIVE) {
+            LOG_INFO("Force killing server process...");
+            TerminateProcess(g_client.server_process, 1);
+        }
+        CloseHandle(g_client.server_process);
+        g_client.server_process = NULL;
+        g_client.server_pid = 0;
+    }
+#endif
 }
 
 static void print_usage(const char *prog) {
     printf("Usage: %s [options]\n", prog);
     printf("\nOptions:\n");
-    printf("  --server URL       WebSocket server URL (for connecting to external server)\n");
+    printf("  --server URL       WebSocket server URL (default: ws://localhost:8765)\n");
     printf("  --computer-id ID   Unique computer identifier (default: hostname)\n");
     printf("  --role ROLE        Role: 'main' or 'player' (default: player)\n");
     printf("  --port PORT        Server port (default: 8765)\n");
     printf("  --ssl              Use SSL/TLS (wss://)\n");
+    printf("  --local-server     Start embedded Python server + client (main role)\n");
     printf("  --debug            Enable debug logging\n");
     printf("  --help             Show this help\n");
-    printf("\nModes:\n");
-    printf("  Server mode:  %s --role main --port 8765\n", prog);
-    printf("                Starts embedded server, other computers connect to this one.\n");
-    printf("  Client mode:  %s --role player --server ws://192.168.1.100:8765\n", prog);
-    printf("                Connects to an existing server.\n");
     printf("\nExamples:\n");
-    printf("  %s --role main --port 8765           # Start as server on port 8765\n", prog);
-    printf("  %s --role player --server ws://192.168.1.100:8765  # Connect to server\n", prog);
+    printf("  %s --role main --server ws://192.168.1.100:8765\n", prog);
+    printf("  %s --role player --server wss://myserver.com:443\n", prog);
+    printf("  %s --local-server --port 8765\n", prog);
 }
 
 int main(int argc, char *argv[]) {
-    /* Load .env file first (before anything else) */
-    load_env_file();
-
     /* Get computer name early (for logging) */
     char computer_name[MAX_HOSTNAME];
     const char *env_id = getenv("COMPUTER_ID");
@@ -4858,20 +4585,16 @@ int main(int argc, char *argv[]) {
         }
     }
     
-    /* Parse computer-id and role from command line early (for logging) */
-    char role[16] = "player";  /* Default role */
+    /* Parse computer-id from command line if provided */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--computer-id") == 0 && i + 1 < argc) {
-            strncpy(computer_name, argv[i + 1], sizeof(computer_name) - 1);
-            computer_name[sizeof(computer_name) - 1] = '\0';
-        } else if (strcmp(argv[i], "--role") == 0 && i + 1 < argc) {
-            strncpy(role, argv[i + 1], sizeof(role) - 1);
-            role[sizeof(role) - 1] = '\0';
+            strncpy(computer_name, argv[++i], sizeof(computer_name) - 1);
+            break;
         }
     }
-
+    
     /* Initialize logging first (before any LOG_* calls) */
-    if (init_logging(computer_name, role) != 0) {
+    if (init_logging(computer_name) != 0) {
         fprintf(stderr, "Warning: Logging initialization failed, continuing with console only\n");
     }
     
@@ -4909,19 +4632,20 @@ int main(int argc, char *argv[]) {
             g_client.config.use_ssl = true;
         } else if (strcmp(argv[i], "--debug") == 0) {
             g_client.config.log_level = LOG_DEBUG;
+        } else if (strcmp(argv[i], "--local-server") == 0) {
+            g_client.config.local_server = true;
         }
     }
-
-    /* Handle --role main without --server: Run embedded server mode */
-    if (strcmp(g_client.config.role, "main") == 0 && g_client.config.server_url[0] == '\0') {
-        /* --role main without --server: Run embedded server mode */
+    
+    /* Handle --local-server mode */
+    if (g_client.config.local_server) {
         const char *local_ip = get_local_ip();
         int port = g_client.config.port;
         char *connection_code = generate_connection_code(local_ip, port);
-
+        
         printf("\n");
         printf("╔═══════════════════════════════════════════════════════════════╗\n");
-        printf("║         EMBEDDED SERVER MODE (No External Server)             ║\n");
+        printf("║           LOCAL SERVER MODE (Low Latency LAN)                 ║\n");
         printf("╚═══════════════════════════════════════════════════════════════╝\n");
         printf("\n");
         printf("  Server IP:   %s\n", local_ip);
@@ -4933,99 +4657,39 @@ int main(int argc, char *argv[]) {
         printf("\n");
         printf("  On other computers, run:\n");
 #ifdef PLATFORM_WINDOWS
+        printf("    .\\start_client.ps1 --connect %s\n", connection_code ? connection_code : "ERROR");
+        printf("    # Or with C binary:\n");
         printf("    .\\input_unified.exe --role player --server ws://%s:%d\n", local_ip, port);
 #else
+        printf("    ./start_client.sh --connect %s\n", connection_code ? connection_code : "ERROR");
+        printf("    # Or with C binary:\n");
         printf("    ./input_unified --role player --server ws://%s:%d\n", local_ip, port);
 #endif
         printf("\n");
-        fflush(stdout);
-
+        printf("  Starting server and client...\n");
+        printf("\n");
+        fflush(stdout);  /* Ensure banner prints before server logs */
+        
         if (connection_code) free(connection_code);
-
-        /* Start embedded WebSocket server */
-        if (start_embedded_server(port) != 0) {
-            LOG_ERROR("Failed to start embedded server");
-            cleanup_logging();
+        
+        /* Start Python server */
+#ifdef PLATFORM_LINUX
+        if (start_local_server(port, &g_client.server_pid) != 0) {
+            LOG_ERROR("Failed to start local server");
             return 1;
         }
-
-        /* Setup signal handlers */
-        signal(SIGINT, signal_handler);
-        signal(SIGTERM, signal_handler);
-#ifndef PLATFORM_WINDOWS
-        signal(SIGPIPE, SIG_IGN);
 #endif
-
-        LOG_INFO("=== Unified Input Server v%s ===", VERSION);
-        LOG_INFO("Platform: %s", PLATFORM_NAME);
-        LOG_INFO("Computer ID: %s", g_client.config.computer_id);
-        LOG_INFO("Role: main (embedded server)");
-        LOG_INFO("Listening on port: %d", port);
-        LOG_INFO("Monitors: %d", g_client.monitor_count);
-
-        /* Register local machine as first client */
-        ServerClient *local_client = &g_server.clients[0];
-        strncpy(local_client->computer_id, g_client.config.computer_id, MAX_HOSTNAME - 1);
-        strcpy(local_client->role, "main");
-        local_client->monitor_count = g_client.monitor_count;
-        for (int i = 0; i < g_client.monitor_count && i < MAX_MONITORS; i++) {
-            memcpy(&local_client->monitors[i], &g_client.monitors[i], sizeof(Monitor));
-        }
-        local_client->registered = true;
-        local_client->wsi = NULL;  /* Local client has no WSI */
-        g_server.client_count = 1;
-
-        /* Set this machine as active */
-        strncpy(g_server.active_computer_id, g_client.config.computer_id, MAX_HOSTNAME - 1);
-        strcpy(g_server.active_monitor_id, g_client.monitor_count > 0 ? g_client.monitors[0].monitor_id : "m0");
-        g_server.cursor_x = g_client.monitor_count > 0 ? g_client.monitors[0].width / 2.0 : 960;
-        g_server.cursor_y = g_client.monitor_count > 0 ? g_client.monitors[0].height / 2.0 : 540;
-
-        g_client.is_active = true;  /* Main is active by default */
-        g_client.running = true;
-
 #ifdef PLATFORM_WINDOWS
-        /* Setup Windows input hooks for main role */
-        if (!setup_windows_hooks(&g_client)) {
-            LOG_WARN("Windows input hooks not available - input capture disabled");
+        if (start_local_server(port, &g_client.server_process, &g_client.server_pid) != 0) {
+            LOG_ERROR("Failed to start local server");
+            return 1;
         }
 #endif
-
-        LOG_INFO("Server running. Waiting for player connections...");
-        LOG_INFO("Press Ctrl+C to stop.");
-
-        /* Server main loop */
-        while (g_server.running && !g_shutdown) {
-#ifdef PLATFORM_WINDOWS
-            /* Process Windows messages (required for low-level hooks to work) */
-            MSG msg;
-            while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-                TranslateMessage(&msg);
-                DispatchMessage(&msg);
-            }
-#endif
-            /* Service WebSocket server */
-            int n = lws_service(g_server.ws_context, 10);
-            if (n < 0) {
-                LOG_ERROR("WebSocket service error");
-                break;
-            }
-        }
-
-        /* Cleanup server */
-        LOG_INFO("Shutting down server...");
-#ifdef PLATFORM_WINDOWS
-        remove_windows_hooks(&g_client);
-#endif
-        if (g_server.ws_context) {
-            lws_context_destroy(g_server.ws_context);
-            g_server.ws_context = NULL;
-        }
-
-        client_cleanup(&g_client);
-        cleanup_logging();
-        return 0;
-
+        
+        /* Set role to main and connect to localhost */
+        strcpy(g_client.config.role, "main");
+        snprintf(g_client.config.server_url, sizeof(g_client.config.server_url),
+                 "ws://127.0.0.1:%d", port);
     } else {
         /* Build server URL if not specified */
         if (g_client.config.server_url[0] == '\0') {
@@ -5035,7 +4699,7 @@ int main(int argc, char *argv[]) {
                      g_client.config.port);
         }
     }
-
+    
     /* Setup signal handlers */
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
@@ -5082,7 +4746,8 @@ int main(int argc, char *argv[]) {
         }
         
         /* Wait for connection to establish */
-        int connect_timeout = 100;  /* 10 seconds */
+        /* Use longer timeout for local server mode (server needs time to fully initialize WebSocket handler) */
+        int connect_timeout = g_client.config.local_server ? 200 : 100;  /* 20s for local, 10s for remote */
         int timeout_seconds = connect_timeout / 10;
         LOG_INFO("Waiting up to %d seconds for WebSocket connection...", timeout_seconds);
         
@@ -5100,7 +4765,14 @@ int main(int argc, char *argv[]) {
         
         if (!g_client.connected) {
             LOG_ERROR("Connection timeout after %d seconds - failed to establish WebSocket connection", timeout_seconds);
-            LOG_ERROR("Server may be unreachable or not responding");
+            if (g_client.config.local_server) {
+                LOG_ERROR("Local server mode: Server process may still be initializing");
+                LOG_ERROR("  - Check if Python server started correctly");
+                LOG_ERROR("  - Check server logs for errors");
+                LOG_ERROR("  - Try increasing connection timeout if server is slow to start");
+            } else {
+                LOG_ERROR("Server may be unreachable or not responding");
+            }
             if (g_client.ws_context) {
                 lws_context_destroy(g_client.ws_context);
                 g_client.ws_context = NULL;
@@ -5161,16 +4833,12 @@ int main(int argc, char *argv[]) {
         }
         
         /* Start clipboard monitor thread for all roles */
-        /* TODO: Fix clipboard_monitor_thread visibility - temporarily disabled */
-        g_client.clipboard_thread_running = false;
-        /*
         g_client.clipboard_thread_running = true;
         if (pthread_create(&g_client.clipboard_thread, NULL,
                            clipboard_monitor_thread, &g_client) != 0) {
             LOG_ERROR("Failed to create clipboard monitor thread");
             g_client.clipboard_thread_running = false;
         }
-        */
 #endif
         
         /* Main event loop */
@@ -5272,7 +4940,37 @@ int main(int argc, char *argv[]) {
     
     /* Cleanup */
     client_cleanup(&g_client);
-
+    
+#ifdef PLATFORM_LINUX
+    /* Stop server process if running */
+    if (g_client.server_pid > 0) {
+        LOG_INFO("Stopping local server (PID: %d)...", g_client.server_pid);
+        kill(g_client.server_pid, SIGTERM);
+        sleep_ms(1000);
+        if (kill(g_client.server_pid, 0) == 0) {
+            LOG_INFO("Force killing server process...");
+            kill(g_client.server_pid, SIGKILL);
+        }
+        g_client.server_pid = 0;
+    }
+#endif
+#ifdef PLATFORM_WINDOWS
+    /* Stop server process if running */
+    if (g_client.server_process != NULL) {
+        LOG_INFO("Stopping local server (PID: %lu)...", g_client.server_pid);
+        TerminateProcess(g_client.server_process, 0);
+        Sleep(1000);
+        DWORD exit_code;
+        if (GetExitCodeProcess(g_client.server_process, &exit_code) && exit_code == STILL_ACTIVE) {
+            LOG_INFO("Force killing server process...");
+            TerminateProcess(g_client.server_process, 1);
+        }
+        CloseHandle(g_client.server_process);
+        g_client.server_process = NULL;
+        g_client.server_pid = 0;
+    }
+#endif
+    
     LOG_INFO("Client stopped");
     cleanup_logging();
     return 0;
