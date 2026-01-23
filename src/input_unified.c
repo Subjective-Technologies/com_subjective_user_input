@@ -1614,6 +1614,39 @@ static void inject_key_linux(Display *display, const char *key, bool is_special,
         else if (strcmp(key, "Key.f10") == 0) keysym = XK_F10;
         else if (strcmp(key, "Key.f11") == 0) keysym = XK_F11;
         else if (strcmp(key, "Key.f12") == 0) keysym = XK_F12;
+        /* Handle Windows VK codes sent as Key.vkNNN */
+        else if (strncmp(key, "Key.vk", 6) == 0) {
+            int vk = atoi(key + 6);
+            switch (vk) {
+                case 160: keysym = XK_Shift_L; break;    /* VK_LSHIFT */
+                case 161: keysym = XK_Shift_R; break;    /* VK_RSHIFT */
+                case 162: keysym = XK_Control_L; break;  /* VK_LCONTROL */
+                case 163: keysym = XK_Control_R; break;  /* VK_RCONTROL */
+                case 164: keysym = XK_Alt_L; break;      /* VK_LMENU */
+                case 165: keysym = XK_Alt_R; break;      /* VK_RMENU */
+                case 9:   keysym = XK_Tab; break;        /* VK_TAB */
+                case 20:  keysym = XK_Caps_Lock; break;  /* VK_CAPITAL */
+                case 27:  keysym = XK_Escape; break;     /* VK_ESCAPE */
+                case 32:  keysym = XK_space; break;      /* VK_SPACE */
+                case 13:  keysym = XK_Return; break;     /* VK_RETURN */
+                case 8:   keysym = XK_BackSpace; break;  /* VK_BACK */
+                case 46:  keysym = XK_Delete; break;     /* VK_DELETE */
+                case 45:  keysym = XK_Insert; break;     /* VK_INSERT */
+                case 36:  keysym = XK_Home; break;       /* VK_HOME */
+                case 35:  keysym = XK_End; break;        /* VK_END */
+                case 33:  keysym = XK_Page_Up; break;    /* VK_PRIOR */
+                case 34:  keysym = XK_Page_Down; break;  /* VK_NEXT */
+                case 37:  keysym = XK_Left; break;       /* VK_LEFT */
+                case 38:  keysym = XK_Up; break;         /* VK_UP */
+                case 39:  keysym = XK_Right; break;      /* VK_RIGHT */
+                case 40:  keysym = XK_Down; break;       /* VK_DOWN */
+                case 91:  keysym = XK_Super_L; break;    /* VK_LWIN */
+                case 92:  keysym = XK_Super_R; break;    /* VK_RWIN */
+                default:
+                    LOG_WARN("Unknown Windows VK code: %d (%s)", vk, key);
+                    return;
+            }
+        }
         else {
             LOG_WARN("Unknown special key: %s", key);
             return;
@@ -2684,10 +2717,37 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
                 case VK_BACK: strcpy(key_name, "Key.backspace"); break;
                 case VK_TAB: strcpy(key_name, "Key.tab"); break;
                 case VK_ESCAPE: strcpy(key_name, "Key.esc"); break;
-                case VK_SHIFT: strcpy(key_name, "Key.shift"); break;
-                case VK_CONTROL: strcpy(key_name, "Key.ctrl"); break;
-                case VK_MENU: strcpy(key_name, "Key.alt"); break;
-                case VK_LWIN: case VK_RWIN: strcpy(key_name, "Key.cmd"); break;
+                case VK_SHIFT: case VK_LSHIFT: strcpy(key_name, "Key.shift"); break;
+                case VK_RSHIFT: strcpy(key_name, "Key.shift_r"); break;
+                case VK_CONTROL: case VK_LCONTROL: strcpy(key_name, "Key.ctrl"); break;
+                case VK_RCONTROL: strcpy(key_name, "Key.ctrl_r"); break;
+                case VK_MENU: case VK_LMENU: strcpy(key_name, "Key.alt"); break;
+                case VK_RMENU: strcpy(key_name, "Key.alt_r"); break;
+                case VK_LWIN: strcpy(key_name, "Key.cmd"); break;
+                case VK_RWIN: strcpy(key_name, "Key.cmd_r"); break;
+                case VK_CAPITAL: strcpy(key_name, "Key.caps_lock"); break;
+                case VK_UP: strcpy(key_name, "Key.up"); break;
+                case VK_DOWN: strcpy(key_name, "Key.down"); break;
+                case VK_LEFT: strcpy(key_name, "Key.left"); break;
+                case VK_RIGHT: strcpy(key_name, "Key.right"); break;
+                case VK_HOME: strcpy(key_name, "Key.home"); break;
+                case VK_END: strcpy(key_name, "Key.end"); break;
+                case VK_PRIOR: strcpy(key_name, "Key.page_up"); break;
+                case VK_NEXT: strcpy(key_name, "Key.page_down"); break;
+                case VK_INSERT: strcpy(key_name, "Key.insert"); break;
+                case VK_DELETE: strcpy(key_name, "Key.delete"); break;
+                case VK_F1: strcpy(key_name, "Key.f1"); break;
+                case VK_F2: strcpy(key_name, "Key.f2"); break;
+                case VK_F3: strcpy(key_name, "Key.f3"); break;
+                case VK_F4: strcpy(key_name, "Key.f4"); break;
+                case VK_F5: strcpy(key_name, "Key.f5"); break;
+                case VK_F6: strcpy(key_name, "Key.f6"); break;
+                case VK_F7: strcpy(key_name, "Key.f7"); break;
+                case VK_F8: strcpy(key_name, "Key.f8"); break;
+                case VK_F9: strcpy(key_name, "Key.f9"); break;
+                case VK_F10: strcpy(key_name, "Key.f10"); break;
+                case VK_F11: strcpy(key_name, "Key.f11"); break;
+                case VK_F12: strcpy(key_name, "Key.f12"); break;
                 default: snprintf(key_name, sizeof(key_name), "Key.vk%d", kb->vkCode); break;
             }
         }
@@ -4627,9 +4687,7 @@ static void handle_server_message(ClientState *client, const char *msg, size_t l
         handle_registration_response(client, json);
     } else if (strcmp(type, "clipboard_update") == 0) {
         LOG_INFO("📋 Received clipboard_update message from server");
-#ifdef PLATFORM_LINUX
         handle_clipboard_update(client, json);
-#endif
     } else {
         LOG_DEBUG("Unknown message type: %s", type);
     }
@@ -5663,6 +5721,14 @@ int main(int argc, char *argv[]) {
             LOG_WARN("Windows input hooks not available - input capture disabled");
         }
 #endif
+
+        /* Start clipboard monitor thread for server mode too */
+        g_client.clipboard_thread_running = true;
+        if (pthread_create(&g_client.clipboard_thread, NULL,
+                           clipboard_monitor_thread, &g_client) != 0) {
+            LOG_ERROR("Failed to create clipboard monitor thread");
+            g_client.clipboard_thread_running = false;
+        }
 
         LOG_INFO("Server running. Waiting for player connections...");
         LOG_INFO("Press Ctrl+C to stop.");
