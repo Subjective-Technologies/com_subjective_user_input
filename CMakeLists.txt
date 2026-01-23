@@ -80,9 +80,11 @@ if(WIN32)
     target_link_libraries(input_unified PRIVATE ws2_32 user32)
 endif()
 
-# Copy .env to output directory (always overrides)
-add_custom_command(TARGET input_unified POST_BUILD
+# Copy .env to output directory (always runs during build)
+add_custom_target(copy_env ALL
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_SOURCE_DIR}/.env" "${OUTPUT_DIR}/.env"
     COMMENT "Copying .env to build output"
+    DEPENDS "${CMAKE_SOURCE_DIR}/.env"
 )
+add_dependencies(input_unified copy_env)
