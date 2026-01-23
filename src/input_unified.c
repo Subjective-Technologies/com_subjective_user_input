@@ -329,6 +329,8 @@ typedef struct {
 
     /* Broadcast message queue (thread-safe for hook callbacks) */
     MessageQueue broadcast_queue;
+    /* Command queue for server-side state changes (e.g., edge crossings) */
+    MessageQueue command_queue;
 } ServerState;
 
 /* Global server state */
@@ -3379,7 +3381,7 @@ static void server_handle_registration(ServerClient *client, const char *json_da
              "\"cursor_x\":%.1f,\"cursor_y\":%.1f}",
              g_server.active_computer_id, g_server.active_monitor_id,
              g_server.cursor_x, g_server.cursor_y);
-    server_broadcast(active_msg);
+    queue_server_broadcast(active_msg, "active_monitor_changed");
 
     /* Apply active change locally in embedded server mode */
     if (g_server.is_server_mode && strcmp(g_client.config.role, "main") == 0) {
@@ -3551,7 +3553,7 @@ static void server_handle_edge_crossing(const char *json_data) {
              "{\"type\":\"active_monitor_changed\",\"computer_id\":\"%s\",\"monitor_id\":\"%s\","
              "\"cursor_x\":%.1f,\"cursor_y\":%.1f}",
              g_server.active_computer_id, g_server.active_monitor_id, new_x, new_y);
-    server_broadcast(msg);
+    queue_server_broadcast(msg, "active_monitor_changed");
 
     /* Apply active change locally in embedded server mode */
     if (g_server.is_server_mode && strcmp(g_client.config.role, "main") == 0) {
@@ -3638,6 +3640,21 @@ static int server_ws_callback(struct lws *wsi, enum lws_callback_reasons reason,
                                 break;
                             }
                         }
+                        if (g_server.active_computer_id[0]) {
+                            char msg[512];
+                            snprintf(msg, sizeof(msg),
+                                     "{\"type\":\"active_monitor_changed\",\"computer_id\":\"%s\",\"monitor_id\":\"%s\","
+                                     "\"cursor_x\":%.1f,\"cursor_y\":%.1f}",
+                                     g_server.active_computer_id, g_server.active_monitor_id,
+                                     g_server.cursor_x, g_server.cursor_y);
+                            queue_server_broadcast(msg, "active_monitor_changed");
+
+                            if (g_server.is_server_mode && strcmp(g_client.config.role, "main") == 0) {
+                                apply_active_monitor_changed(&g_client, g_server.active_computer_id,
+                                                             g_server.active_monitor_id,
+                                                             g_server.cursor_x, g_server.cursor_y);
+                            }
+                        }
                     }
                 }
                 server_free_client(client);
@@ -3708,8 +3725,9 @@ static int start_embedded_server(int port) {
     struct lws_context_creation_info info;
     memset(&info, 0, sizeof(info));
 
-    /* Initialize broadcast queue for thread-safe messaging from hooks */
+    /* Initialize queues for thread-safe messaging from hooks */
     msg_queue_init(&g_server.broadcast_queue);
+    msg_queue_init(&g_server.command_queue);
 
     info.port = port;
     info.protocols = server_protocols;
@@ -3818,7 +3836,7 @@ static void send_edge_crossing_request(ClientState *client, const char *edge,
     
     /* In server mode, handle edge crossing directly */
     if (g_server.is_server_mode) {
-        server_handle_edge_crossing(json_msg);
+        queue_server_command(json_msg, "edge_crossing_request");
         return;
     }
     queue_client_message(client, json_msg, "edge_crossing_request");
@@ -4209,6 +4227,22 @@ static void apply_active_monitor_changed(ClientState *client,
         while (ShowCursor(FALSE) >= 0);  /* Hide cursor */
 #endif
         LOG_INFO("This computer is INACTIVE - local input blocked");
+    }
+}
+
+/* Queue command for server thread (thread-safe). */
+static void queue_server_command(const char *msg, const char *tag) {
+    if (!msg_queue_push(&g_server.command_queue, msg)) {
+        static int drop_count = 0;
+        drop_count++;
+        if (drop_count <= 3 || drop_count % 100 == 0) {
+            LOG_WARN("Server command queue full, dropping %s (%d total)", tag, drop_count);
+        }
+        return;
+    }
+
+    if (g_server.ws_context) {
+        lws_cancel_service(g_server.ws_context);
     }
 }
 
@@ -5323,6 +5357,15 @@ int main(int argc, char *argv[]) {
                 break;
             }
 
+            /* Process server commands queued by hooks (e.g., edge crossings) */
+            char cmd_msg[MSG_MAX_LEN];
+            int cmd_count = 0;
+            while (msg_queue_pop(&g_server.command_queue, cmd_msg, sizeof(cmd_msg))) {
+                server_handle_edge_crossing(cmd_msg);
+                cmd_count++;
+                if (cmd_count >= 64) break;
+            }
+
             /* Process broadcast queue (drain messages queued by hooks) */
             char queued_msg[MSG_MAX_LEN];
             int broadcast_sent = 0;
@@ -5360,6 +5403,7 @@ int main(int argc, char *argv[]) {
             g_server.ws_context = NULL;
         }
         msg_queue_destroy(&g_server.broadcast_queue);
+        msg_queue_destroy(&g_server.command_queue);
 
         client_cleanup(&g_client);
         cleanup_logging();
