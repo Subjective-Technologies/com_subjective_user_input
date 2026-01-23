@@ -2660,14 +2660,7 @@ static void send_mouse_move_fast(ClientState *client, int x, int y, double now_m
 /* Windows low-level keyboard hook */
 static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode >= 0 && g_client.running && strcmp(g_client.config.role, "main") == 0) {
-        if (!g_client.is_active) {
-            static int kb_block_count = 0;
-            if (kb_block_count < 5) {
-                kb_block_count++;
-                LOG_INFO("HOOK: blocking local keyboard input (main inactive)");
-            }
-            return 1; /* Block local input when inactive */
-        }
+        bool block_local = !g_client.is_active;
         KBDLLHOOKSTRUCT *kb = (KBDLLHOOKSTRUCT *)lParam;
         bool press = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
         
@@ -2700,6 +2693,15 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         snprintf(json, sizeof(json), "{\"action\":\"%s\",\"key\":\"%s\",\"is_special\":%s}",
                  press ? "press" : "release", key_name, is_special ? "true" : "false");
         send_input_event(&g_client, "keyboard", json);
+
+        if (block_local) {
+            static int kb_block_count = 0;
+            if (kb_block_count < 5) {
+                kb_block_count++;
+                LOG_INFO("HOOK: blocking local keyboard input (main inactive)");
+            }
+            return 1; /* Block local input while forwarding */
+        }
     }
     
     return CallNextHookEx(NULL, nCode, wParam, lParam);
@@ -2730,15 +2732,7 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
         return CallNextHookEx(NULL, nCode, wParam, lParam);
     }
 
-    /* Block local input when main is inactive (exclusive control on active computer) */
-    if (!g_client.is_active) {
-        static int inactive_block_count = 0;
-        if (inactive_block_count < 5) {
-            inactive_block_count++;
-            LOG_INFO("HOOK: blocking local mouse input (main inactive)");
-        }
-        return 1; /* Block local input when inactive */
-    }
+    bool block_local = !g_client.is_active;
 
     MSLLHOOKSTRUCT *ms = (MSLLHOOKSTRUCT *)lParam;
     POINT pt = ms->pt;
@@ -2748,7 +2742,7 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
             /* Skip if we're ignoring mouse moves (after injecting cursor position) */
             if (g_client.skip_mouse_moves > 0) {
                 g_client.skip_mouse_moves--;
-                return CallNextHookEx(NULL, nCode, wParam, lParam);
+                return block_local ? 1 : CallNextHookEx(NULL, nCode, wParam, lParam);
             }
             
             /* Throttle mouse moves - increased to 16ms to reduce hook overhead */
@@ -2793,39 +2787,40 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
                 last_y = pt.y;
                 hook_send_count++;
 
-                /* Edge detection for screen boundary crossing */
-                int screen_w = (g_client.monitor_count > 0) ? g_client.monitors[0].width : 1920;
-                int screen_h = (g_client.monitor_count > 0) ? g_client.monitors[0].height : 1080;
-                bool at_edge = (pt.x <= 5 || pt.x >= screen_w - 5 ||
-                               pt.y <= 5 || pt.y >= screen_h - 5);
+                /* Edge detection for screen boundary crossing (only when active) */
+                if (!block_local) {
+                    int screen_w = (g_client.monitor_count > 0) ? g_client.monitors[0].width : 1920;
+                    int screen_h = (g_client.monitor_count > 0) ? g_client.monitors[0].height : 1080;
+                    bool at_edge = (pt.x <= 5 || pt.x >= screen_w - 5 ||
+                                   pt.y <= 5 || pt.y >= screen_h - 5);
 
-                /* Detect which edge and send edge crossing request if at edge and active */
-                if (at_edge && g_client.is_active) {
-                    const char *edge = NULL;
-                    float position = 0.0f;
+                    if (at_edge) {
+                        const char *edge = NULL;
+                        float position = 0.0f;
 
-                    if (pt.x <= 5) {
-                        edge = "left";
-                        position = (float)pt.y / screen_h;
-                    } else if (pt.x >= screen_w - 5) {
-                        edge = "right";
-                        position = (float)pt.y / screen_h;
-                    } else if (pt.y <= 5) {
-                        edge = "top";
-                        position = (float)pt.x / screen_w;
-                    } else if (pt.y >= screen_h - 5) {
-                        edge = "bottom";
-                        position = (float)pt.x / screen_w;
-                    }
+                        if (pt.x <= 5) {
+                            edge = "left";
+                            position = (float)pt.y / screen_h;
+                        } else if (pt.x >= screen_w - 5) {
+                            edge = "right";
+                            position = (float)pt.y / screen_h;
+                        } else if (pt.y <= 5) {
+                            edge = "top";
+                            position = (float)pt.x / screen_w;
+                        } else if (pt.y >= screen_h - 5) {
+                            edge = "bottom";
+                            position = (float)pt.x / screen_w;
+                        }
 
-                    if (edge) {
-                        /* Throttle edge crossing requests to max once per 200ms */
-                        static double last_edge_request_time = 0;
-                        if (now - last_edge_request_time >= 200) {
-                            LOG_INFO("Edge detected: %s at (%.2f) cursor=(%d,%d) screen=%dx%d",
-                                     edge, position, pt.x, pt.y, screen_w, screen_h);
-                            send_edge_crossing_request(&g_client, edge, position, pt.x, pt.y);
-                            last_edge_request_time = now;
+                        if (edge) {
+                            /* Throttle edge crossing requests to max once per 200ms */
+                            static double last_edge_request_time = 0;
+                            if (now - last_edge_request_time >= 200) {
+                                LOG_INFO("Edge detected: %s at (%.2f) cursor=(%d,%d) screen=%dx%d",
+                                         edge, position, pt.x, pt.y, screen_w, screen_h);
+                                send_edge_crossing_request(&g_client, edge, position, pt.x, pt.y);
+                                last_edge_request_time = now;
+                            }
                         }
                     }
                 }
@@ -2878,6 +2873,15 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
             send_input_event(&g_client, "mouse_scroll", json);
             break;
         }
+    }
+
+    if (block_local) {
+        static int inactive_block_count = 0;
+        if (inactive_block_count < 5) {
+            inactive_block_count++;
+            LOG_INFO("HOOK: blocking local mouse input (main inactive)");
+        }
+        return 1; /* Block local input while forwarding */
     }
 
     return CallNextHookEx(NULL, nCode, wParam, lParam);
