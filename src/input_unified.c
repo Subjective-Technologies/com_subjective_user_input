@@ -201,6 +201,10 @@ typedef struct {
 #ifdef PLATFORM_LINUX
     pthread_mutex_t mutex;
 #endif
+#ifdef PLATFORM_WINDOWS
+    CRITICAL_SECTION cs;
+    bool cs_initialized;
+#endif
 } MessageQueue;
 
 /* Client state */
@@ -309,6 +313,9 @@ typedef struct {
     double last_edge_crossing_time;
     char last_crossed_from_computer[MAX_HOSTNAME];
     char last_crossed_from_monitor[32];
+
+    /* Broadcast message queue (thread-safe for hook callbacks) */
+    MessageQueue broadcast_queue;
 } ServerState;
 
 /* Global server state */
@@ -537,11 +544,21 @@ static void msg_queue_init(MessageQueue *q) {
 #ifdef PLATFORM_LINUX
     pthread_mutex_init(&q->mutex, NULL);
 #endif
+#ifdef PLATFORM_WINDOWS
+    InitializeCriticalSection(&q->cs);
+    q->cs_initialized = true;
+#endif
 }
 
 static void msg_queue_destroy(MessageQueue *q) {
 #ifdef PLATFORM_LINUX
     pthread_mutex_destroy(&q->mutex);
+#endif
+#ifdef PLATFORM_WINDOWS
+    if (q->cs_initialized) {
+        DeleteCriticalSection(&q->cs);
+        q->cs_initialized = false;
+    }
 #endif
 }
 
@@ -549,16 +566,19 @@ static void msg_queue_destroy(MessageQueue *q) {
 static bool msg_queue_push(MessageQueue *q, const char *msg) {
     bool success = false;
     size_t len = strlen(msg);
-    
+
 #ifdef PLATFORM_LINUX
     pthread_mutex_lock(&q->mutex);
 #endif
-    
+#ifdef PLATFORM_WINDOWS
+    if (q->cs_initialized) EnterCriticalSection(&q->cs);
+#endif
+
     if (len >= MSG_MAX_LEN) {
         /* Message too large - log and drop */
         static int too_large_count = 0;
         too_large_count++;
-        LOG_WARN("📋 Message too large for queue: %zu bytes (max %d) - dropped #%d", 
+        LOG_WARN("Message too large for queue: %zu bytes (max %d) - dropped #%d",
                  len, MSG_MAX_LEN, too_large_count);
     } else if (q->count < MSG_QUEUE_SIZE) {
         strncpy(q->messages[q->tail], msg, MSG_MAX_LEN - 1);
@@ -567,9 +587,12 @@ static bool msg_queue_push(MessageQueue *q, const char *msg) {
         q->count++;
         success = true;
     }
-    
+
 #ifdef PLATFORM_LINUX
     pthread_mutex_unlock(&q->mutex);
+#endif
+#ifdef PLATFORM_WINDOWS
+    if (q->cs_initialized) LeaveCriticalSection(&q->cs);
 #endif
     return success;
 }
@@ -580,7 +603,10 @@ static bool msg_queue_pop(MessageQueue *q, char *out_msg, size_t out_size) {
 #ifdef PLATFORM_LINUX
     pthread_mutex_lock(&q->mutex);
 #endif
-    
+#ifdef PLATFORM_WINDOWS
+    if (q->cs_initialized) EnterCriticalSection(&q->cs);
+#endif
+
     if (q->count > 0) {
         strncpy(out_msg, q->messages[q->head], out_size - 1);
         out_msg[out_size - 1] = '\0';
@@ -588,9 +614,12 @@ static bool msg_queue_pop(MessageQueue *q, char *out_msg, size_t out_size) {
         q->count--;
         success = true;
     }
-    
+
 #ifdef PLATFORM_LINUX
     pthread_mutex_unlock(&q->mutex);
+#endif
+#ifdef PLATFORM_WINDOWS
+    if (q->cs_initialized) LeaveCriticalSection(&q->cs);
 #endif
     return success;
 }
@@ -601,9 +630,15 @@ static bool msg_queue_has_messages(MessageQueue *q) {
 #ifdef PLATFORM_LINUX
     pthread_mutex_lock(&q->mutex);
 #endif
+#ifdef PLATFORM_WINDOWS
+    if (q->cs_initialized) EnterCriticalSection(&q->cs);
+#endif
     has = (q->count > 0);
 #ifdef PLATFORM_LINUX
     pthread_mutex_unlock(&q->mutex);
+#endif
+#ifdef PLATFORM_WINDOWS
+    if (q->cs_initialized) LeaveCriticalSection(&q->cs);
 #endif
     return has;
 }
@@ -614,9 +649,15 @@ static int msg_queue_count(MessageQueue *q) {
 #ifdef PLATFORM_LINUX
     pthread_mutex_lock(&q->mutex);
 #endif
+#ifdef PLATFORM_WINDOWS
+    if (q->cs_initialized) EnterCriticalSection(&q->cs);
+#endif
     count = q->count;
 #ifdef PLATFORM_LINUX
     pthread_mutex_unlock(&q->mutex);
+#endif
+#ifdef PLATFORM_WINDOWS
+    if (q->cs_initialized) LeaveCriticalSection(&q->cs);
 #endif
     return count;
 }
@@ -3464,6 +3505,45 @@ static int server_ws_callback(struct lws *wsi, enum lws_callback_reasons reason,
             }
             break;
 
+        case LWS_CALLBACK_SERVER_WRITEABLE:
+            /* Drain broadcast queue and send to this client */
+            if (client && client->registered) {
+                char msg[MSG_MAX_LEN];
+                int sent = 0;
+                while (msg_queue_pop(&g_server.broadcast_queue, msg, sizeof(msg))) {
+                    /* Broadcast this message to ALL registered clients */
+                    for (int i = 0; i < MAX_SERVER_CLIENTS; i++) {
+                        if (g_server.clients[i].registered && g_server.clients[i].wsi) {
+                            size_t len = strlen(msg);
+                            unsigned char *buf = malloc(LWS_PRE + len + 1);
+                            if (buf) {
+                                memcpy(buf + LWS_PRE, msg, len);
+                                lws_write(g_server.clients[i].wsi, buf + LWS_PRE, len, LWS_WRITE_TEXT);
+                                free(buf);
+                            }
+                        }
+                    }
+                    sent++;
+                    if (sent >= 64) break;  /* Limit per callback */
+                }
+                /* If more messages, request another writable callback */
+                if (msg_queue_has_messages(&g_server.broadcast_queue)) {
+                    lws_callback_on_writable(wsi);
+                }
+            }
+            break;
+
+        case LWS_CALLBACK_EVENT_WAIT_CANCELLED:
+            /* Triggered by lws_cancel_service - request writable for all clients */
+            if (msg_queue_has_messages(&g_server.broadcast_queue)) {
+                for (int i = 0; i < MAX_SERVER_CLIENTS; i++) {
+                    if (g_server.clients[i].registered && g_server.clients[i].wsi) {
+                        lws_callback_on_writable(g_server.clients[i].wsi);
+                    }
+                }
+            }
+            break;
+
         default:
             break;
     }
@@ -3487,6 +3567,9 @@ static struct lws_protocols server_protocols[] = {
 static int start_embedded_server(int port) {
     struct lws_context_creation_info info;
     memset(&info, 0, sizeof(info));
+
+    /* Initialize broadcast queue for thread-safe messaging from hooks */
+    msg_queue_init(&g_server.broadcast_queue);
 
     info.port = port;
     info.protocols = server_protocols;
@@ -3619,7 +3702,7 @@ static void send_input_event(ClientState *client, const char *event_type,
         return;
     }
     
-    /* In server mode, broadcast directly to connected clients */
+    /* In server mode, queue message for async broadcast (avoid blocking hook) */
     if (g_server.is_server_mode) {
         /* Build full message with active computer info */
         char full_msg[MAX_MESSAGE_SIZE];
@@ -3637,16 +3720,20 @@ static void send_input_event(ClientState *client, const char *event_type,
             full_msg[sizeof(full_msg) - 1] = '\0';
         }
 
-        /* Debug: log occasional broadcasts */
-        static int broadcast_count = 0;
-        broadcast_count++;
-        if (broadcast_count <= 5 || broadcast_count % 500 == 0) {
-            LOG_DEBUG("Server broadcast #%d: %s to active=%s:%s",
-                     broadcast_count, event_type,
-                     g_server.active_computer_id, g_server.active_monitor_id);
+        /* Queue message instead of direct broadcast (thread-safe for hooks) */
+        if (!msg_queue_push(&g_server.broadcast_queue, full_msg)) {
+            static int overflow_count = 0;
+            overflow_count++;
+            if (overflow_count <= 3 || overflow_count % 100 == 0) {
+                LOG_WARN("Server broadcast queue full, dropping event (%d total)", overflow_count);
+            }
+        } else {
+            /* Wake up lws event loop to process queued messages */
+            if (g_server.ws_context) {
+                lws_cancel_service(g_server.ws_context);
+            }
         }
 
-        server_broadcast(full_msg);
         free(msg);
         return;
     }
@@ -4503,9 +4590,18 @@ static int client_init(ClientState *client) {
 #endif
     
     /* Get hostname for computer_id */
+#ifdef PLATFORM_WINDOWS
+    {
+        DWORD size = sizeof(client->config.computer_id);
+        if (!GetComputerNameA(client->config.computer_id, &size)) {
+            strcpy(client->config.computer_id, "unknown");
+        }
+    }
+#else
     if (gethostname(client->config.computer_id, sizeof(client->config.computer_id)) != 0) {
         strcpy(client->config.computer_id, "unknown");
     }
+#endif
     
     /* Detect monitors */
     client->monitor_count = detect_monitors(client->monitors, MAX_MONITORS);
@@ -4852,10 +4948,19 @@ int main(int argc, char *argv[]) {
     const char *env_id = getenv("COMPUTER_ID");
     if (env_id && env_id[0]) {
         strncpy(computer_name, env_id, sizeof(computer_name) - 1);
+        computer_name[sizeof(computer_name) - 1] = '\0';
     } else {
+#ifdef PLATFORM_WINDOWS
+        /* Use GetComputerNameA on Windows (doesn't require Winsock) */
+        DWORD size = sizeof(computer_name);
+        if (!GetComputerNameA(computer_name, &size)) {
+            strcpy(computer_name, "unknown");
+        }
+#else
         if (gethostname(computer_name, sizeof(computer_name)) != 0) {
             strcpy(computer_name, "unknown");
         }
+#endif
     }
     
     /* Parse computer-id and role from command line early (for logging) */
@@ -5010,6 +5115,26 @@ int main(int argc, char *argv[]) {
                 LOG_ERROR("WebSocket service error");
                 break;
             }
+
+            /* Process broadcast queue (drain messages queued by hooks) */
+            char queued_msg[MSG_MAX_LEN];
+            int broadcast_sent = 0;
+            while (msg_queue_pop(&g_server.broadcast_queue, queued_msg, sizeof(queued_msg))) {
+                /* Send to all registered clients */
+                for (int i = 0; i < MAX_SERVER_CLIENTS; i++) {
+                    if (g_server.clients[i].registered && g_server.clients[i].wsi) {
+                        size_t len = strlen(queued_msg);
+                        unsigned char *buf = malloc(LWS_PRE + len + 1);
+                        if (buf) {
+                            memcpy(buf + LWS_PRE, queued_msg, len);
+                            lws_write(g_server.clients[i].wsi, buf + LWS_PRE, len, LWS_WRITE_TEXT);
+                            free(buf);
+                        }
+                    }
+                }
+                broadcast_sent++;
+                if (broadcast_sent >= 128) break;  /* Limit per iteration */
+            }
         }
 
         /* Cleanup server */
@@ -5021,6 +5146,7 @@ int main(int argc, char *argv[]) {
             lws_context_destroy(g_server.ws_context);
             g_server.ws_context = NULL;
         }
+        msg_queue_destroy(&g_server.broadcast_queue);
 
         client_cleanup(&g_client);
         cleanup_logging();
