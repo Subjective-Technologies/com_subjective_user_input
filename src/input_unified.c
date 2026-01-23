@@ -2658,6 +2658,14 @@ static void send_mouse_move_fast(ClientState *client, int x, int y, double now_m
 /* Windows low-level keyboard hook */
 static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode >= 0 && g_client.running && strcmp(g_client.config.role, "main") == 0) {
+        if (!g_client.is_active) {
+            static int kb_block_count = 0;
+            if (kb_block_count < 5) {
+                kb_block_count++;
+                LOG_INFO("HOOK: blocking local keyboard input (main inactive)");
+            }
+            return 1; /* Block local input when inactive */
+        }
         KBDLLHOOKSTRUCT *kb = (KBDLLHOOKSTRUCT *)lParam;
         bool press = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
         
@@ -2720,13 +2728,14 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
         return CallNextHookEx(NULL, nCode, wParam, lParam);
     }
 
-    /* Log inactive state a few times to confirm local input is not suppressed */
+    /* Block local input when main is inactive (exclusive control on active computer) */
     if (!g_client.is_active) {
-        static int inactive_log_count = 0;
-        if (inactive_log_count < 5) {
-            inactive_log_count++;
-            LOG_INFO("HOOK: main is inactive (local input not blocked on Windows)");
+        static int inactive_block_count = 0;
+        if (inactive_block_count < 5) {
+            inactive_block_count++;
+            LOG_INFO("HOOK: blocking local mouse input (main inactive)");
         }
+        return 1; /* Block local input when inactive */
     }
 
     MSLLHOOKSTRUCT *ms = (MSLLHOOKSTRUCT *)lParam;
