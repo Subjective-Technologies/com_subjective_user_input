@@ -266,6 +266,8 @@ typedef struct {
     HANDLE hook_thread;
     DWORD hook_thread_id;
     bool hook_thread_running;
+    HWND raw_input_hwnd;
+    bool raw_input_initialized;
 #endif
     
 #ifdef PLATFORM_MACOS
@@ -2656,6 +2658,7 @@ static void send_input_event(ClientState *client, const char *event_type,
 static void send_edge_crossing_request(ClientState *client, const char *edge,
                                        float position, int cursor_x, int cursor_y);
 static void send_mouse_move_fast(ClientState *client, int x, int y, double now_ms);
+static void queue_server_command(const char *msg, const char *tag);
 
 /* Windows low-level keyboard hook */
 static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
@@ -2781,11 +2784,13 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
             }
             
             if (should_send) {
-                send_mouse_move_fast(&g_client, pt.x, pt.y, now);
+                if (!block_local) {
+                    send_mouse_move_fast(&g_client, pt.x, pt.y, now);
+                    hook_send_count++;
+                }
                 last_move_time = now;
                 last_x = pt.x;
                 last_y = pt.y;
-                hook_send_count++;
 
                 /* Edge detection for screen boundary crossing (only when active) */
                 if (!block_local) {
@@ -2923,6 +2928,101 @@ static void remove_windows_hooks(ClientState *client) {
     }
 }
 
+/* Raw input handling (mouse deltas) */
+static void handle_raw_input(ClientState *client, LPARAM lParam) {
+    if (!client || !client->running) return;
+    if (strcmp(client->config.role, "main") != 0) return;
+    if (!g_server.is_server_mode) return;
+    if (client->is_active) return;  /* Use deltas only when inactive */
+
+    UINT size = 0;
+    if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT, NULL, &size, sizeof(RAWINPUTHEADER)) != 0) {
+        return;
+    }
+    RAWINPUT *raw = (RAWINPUT *)malloc(size);
+    if (!raw) return;
+    if (GetRawInputData((HRAWINPUT)lParam, RID_INPUT, raw, &size, sizeof(RAWINPUTHEADER)) != size) {
+        free(raw);
+        return;
+    }
+
+    if (raw->header.dwType == RIM_TYPEMOUSE) {
+        LONG dx = raw->data.mouse.lLastX;
+        LONG dy = raw->data.mouse.lLastY;
+        if (dx != 0 || dy != 0) {
+            static int acc_dx = 0;
+            static int acc_dy = 0;
+            static double last_send = 0;
+            double now = get_time_ms();
+            acc_dx += (int)dx;
+            acc_dy += (int)dy;
+            if (now - last_send >= 8) {
+                char msg[256];
+                snprintf(msg, sizeof(msg),
+                         "{\"type\":\"mouse_delta\",\"device_id\":\"%s\",\"dx\":%d,\"dy\":%d}",
+                         client->config.computer_id, acc_dx, acc_dy);
+                queue_server_command(msg, "mouse_delta");
+                acc_dx = 0;
+                acc_dy = 0;
+                last_send = now;
+            }
+        }
+    }
+
+    free(raw);
+}
+
+static LRESULT CALLBACK raw_input_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_INPUT) {
+        ClientState *client = (ClientState *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+        handle_raw_input(client, lParam);
+        return 0;
+    }
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+static bool init_raw_input(ClientState *client) {
+    if (client->raw_input_initialized) return true;
+
+    WNDCLASSA wc = {0};
+    wc.lpfnWndProc = raw_input_wndproc;
+    wc.hInstance = GetModuleHandle(NULL);
+    wc.lpszClassName = "InputUnifiedRawInputWindow";
+    RegisterClassA(&wc);
+
+    HWND hwnd = CreateWindowExA(0, wc.lpszClassName, "RawInput",
+                                0, 0, 0, 0, 0, HWND_MESSAGE, NULL, wc.hInstance, NULL);
+    if (!hwnd) {
+        LOG_ERROR("Failed to create raw input window (error: %lu)", GetLastError());
+        return false;
+    }
+    SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)client);
+
+    RAWINPUTDEVICE rid;
+    rid.usUsagePage = 0x01; /* Generic Desktop */
+    rid.usUsage = 0x02;     /* Mouse */
+    rid.dwFlags = RIDEV_INPUTSINK;
+    rid.hwndTarget = hwnd;
+    if (!RegisterRawInputDevices(&rid, 1, sizeof(rid))) {
+        LOG_ERROR("Failed to register raw input (error: %lu)", GetLastError());
+        DestroyWindow(hwnd);
+        return false;
+    }
+
+    client->raw_input_hwnd = hwnd;
+    client->raw_input_initialized = true;
+    LOG_INFO("Raw input initialized for mouse deltas");
+    return true;
+}
+
+static void destroy_raw_input(ClientState *client) {
+    if (client->raw_input_hwnd) {
+        DestroyWindow(client->raw_input_hwnd);
+        client->raw_input_hwnd = NULL;
+    }
+    client->raw_input_initialized = false;
+}
+
 /* Run Windows hooks on a dedicated thread with its own message loop. */
 static DWORD WINAPI hook_thread_proc(LPVOID param) {
     ClientState *client = (ClientState *)param;
@@ -2936,6 +3036,10 @@ static DWORD WINAPI hook_thread_proc(LPVOID param) {
         return 1;
     }
 
+    if (!init_raw_input(client)) {
+        LOG_WARN("Raw input not available - delta mode disabled");
+    }
+
     client->hook_thread_running = true;
 
     while (client->running && GetMessage(&msg, NULL, 0, 0) > 0) {
@@ -2945,6 +3049,7 @@ static DWORD WINAPI hook_thread_proc(LPVOID param) {
 
     client->hook_thread_running = false;
     remove_windows_hooks(client);
+    destroy_raw_input(client);
     return 0;
 }
 
@@ -3581,6 +3686,69 @@ static void server_handle_edge_crossing(const char *json_data) {
         apply_active_monitor_changed(&g_client, g_server.active_computer_id,
                                      g_server.active_monitor_id, new_x, new_y);
     }
+}
+
+static void server_handle_command(const char *json_data) {
+    if (strstr(json_data, "\"type\":\"mouse_delta\"") ||
+        strstr(json_data, "\"type\": \"mouse_delta\"")) {
+        server_handle_mouse_delta(json_data);
+    } else if (strstr(json_data, "\"type\":\"edge_crossing_request\"") ||
+               strstr(json_data, "\"type\": \"edge_crossing_request\"")) {
+        server_handle_edge_crossing(json_data);
+    }
+}
+
+/* Handle mouse delta command from active computer */
+static void server_handle_mouse_delta(const char *json_data) {
+    char device_id[MAX_HOSTNAME] = "";
+    int dx = 0, dy = 0;
+
+    const char *did = strstr(json_data, "\"device_id\"");
+    if (did) {
+        did = strchr(did + 11, '"');
+        if (did) {
+            did++;
+            const char *end = strchr(did, '"');
+            if (end && end - did < MAX_HOSTNAME) {
+                strncpy(device_id, did, end - did);
+            }
+        }
+    }
+
+    const char *dxp = strstr(json_data, "\"dx\"");
+    if (dxp) {
+        dxp = strchr(dxp + 4, ':');
+        if (dxp) dx = atoi(dxp + 1);
+    }
+    const char *dyp = strstr(json_data, "\"dy\"");
+    if (dyp) {
+        dyp = strchr(dyp + 4, ':');
+        if (dyp) dy = atoi(dyp + 1);
+    }
+
+    if (device_id[0] == '\0') return;
+    if (strcmp(device_id, g_server.active_computer_id) != 0) return;
+
+    ServerClient *target = server_find_client_by_id(g_server.active_computer_id);
+    int screen_w = (target && target->monitor_count > 0) ? target->monitors[0].width : 1920;
+    int screen_h = (target && target->monitor_count > 0) ? target->monitors[0].height : 1080;
+
+    g_server.cursor_x += dx;
+    g_server.cursor_y += dy;
+
+    if (g_server.cursor_x < 0) g_server.cursor_x = 0;
+    if (g_server.cursor_y < 0) g_server.cursor_y = 0;
+    if (g_server.cursor_x > screen_w - 1) g_server.cursor_x = screen_w - 1;
+    if (g_server.cursor_y > screen_h - 1) g_server.cursor_y = screen_h - 1;
+
+    char msg[512];
+    snprintf(msg, sizeof(msg),
+             "{\"type\":\"input_event\",\"event_type\":\"mouse_move\","
+             "\"data\":{\"x\":%.0f,\"y\":%.0f},\"device_id\":\"%s\",\"delta_ms\":0,"
+             "\"active_computer_id\":\"%s\",\"active_monitor_id\":\"%s\"}",
+             g_server.cursor_x, g_server.cursor_y, device_id,
+             g_server.active_computer_id, g_server.active_monitor_id);
+    queue_server_broadcast(msg, "mouse_move");
 }
 
 /* Handle message from client */
@@ -4245,6 +4413,13 @@ static void apply_active_monitor_changed(ClientState *client,
 #ifdef PLATFORM_WINDOWS
         if (strcmp(client->config.role, "main") == 0) {
             LOG_INFO("Windows main inactive: local input blocked by hooks");
+        }
+        if (client->monitor_count > 0) {
+            int cx = client->monitors[0].width / 2;
+            int cy = client->monitors[0].height / 2;
+            client->skip_mouse_moves = 5;
+            SetCursorPos(cx, cy);
+            LOG_INFO("Pinned cursor to center (%d, %d)", cx, cy);
         }
         /* Hide cursor */
         while (ShowCursor(FALSE) >= 0);  /* Hide cursor */
@@ -5392,7 +5567,7 @@ int main(int argc, char *argv[]) {
                 if (cmd_count == 0) {
                     LOG_INFO("Server command processing started");
                 }
-                server_handle_edge_crossing(cmd_msg);
+                server_handle_command(cmd_msg);
                 cmd_count++;
                 if (cmd_count >= 64) break;
             }
