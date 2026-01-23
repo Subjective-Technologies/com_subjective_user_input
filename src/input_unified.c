@@ -299,6 +299,11 @@ typedef struct {
     size_t rx_len;
 } ServerClient;
 
+/* Per-connection session data (points into g_server.clients) */
+typedef struct {
+    ServerClient *client;
+} ServerClientSession;
+
 /* Server state */
 typedef struct {
     bool running;
@@ -3195,7 +3200,7 @@ static ServerClient* server_find_client_by_id(const char *computer_id) {
 /* Allocate a new client slot */
 static ServerClient* server_allocate_client(struct lws *wsi) {
     for (int i = 0; i < MAX_SERVER_CLIENTS; i++) {
-        if (g_server.clients[i].wsi == NULL) {
+        if (!g_server.clients[i].registered && g_server.clients[i].wsi == NULL) {
             memset(&g_server.clients[i], 0, sizeof(ServerClient));
             g_server.clients[i].wsi = wsi;
             g_server.client_count++;
@@ -3523,25 +3528,25 @@ static void server_handle_message(ServerClient *client, const char *json_data, s
 /* Server WebSocket callback */
 static int server_ws_callback(struct lws *wsi, enum lws_callback_reasons reason,
                                void *user, void *in, size_t len) {
-    ServerClient *client = (ServerClient *)user;
+    ServerClientSession *session = (ServerClientSession *)user;
+    ServerClient *client = session ? session->client : NULL;
 
     switch (reason) {
         case LWS_CALLBACK_ESTABLISHED:
             LOG_INFO("Server: New connection");
-            if (!client) {
-                client = server_allocate_client(wsi);
-                if (!client) {
+            if (session && !session->client) {
+                session->client = server_allocate_client(wsi);
+                if (!session->client) {
                     LOG_ERROR("Server: Max clients reached");
                     return -1;
                 }
             }
-            client->wsi = wsi;
+            client = session ? session->client : NULL;
+            if (client) client->wsi = wsi;
             break;
 
         case LWS_CALLBACK_RECEIVE:
-            if (!client) {
-                client = server_find_client_by_wsi(wsi);
-            }
+            if (!client) client = server_find_client_by_wsi(wsi);
             if (client && len > 0 && in) {
                 if (client->rx_len + len < MAX_MESSAGE_SIZE) {
                     memcpy(client->rx_buffer + client->rx_len, in, len);
@@ -3557,9 +3562,7 @@ static int server_ws_callback(struct lws *wsi, enum lws_callback_reasons reason,
 
         case LWS_CALLBACK_CLOSED:
             LOG_INFO("Server: Connection closed");
-            if (!client) {
-                client = server_find_client_by_wsi(wsi);
-            }
+            if (!client) client = server_find_client_by_wsi(wsi);
             if (client) {
                 if (client->registered) {
                     LOG_INFO("Server: Client '%s' disconnected", client->computer_id);
@@ -3583,6 +3586,7 @@ static int server_ws_callback(struct lws *wsi, enum lws_callback_reasons reason,
                 }
                 server_free_client(client);
             }
+            if (session) session->client = NULL;
             break;
 
         case LWS_CALLBACK_SERVER_WRITEABLE:
@@ -3636,7 +3640,7 @@ static struct lws_protocols server_protocols[] = {
     {
         "kvm-protocol",
         server_ws_callback,
-        sizeof(ServerClient),
+        sizeof(ServerClientSession),
         MAX_MESSAGE_SIZE,
         0, NULL, 0
     },
