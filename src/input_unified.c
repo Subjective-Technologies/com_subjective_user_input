@@ -2841,24 +2841,31 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
         case WM_LBUTTONDOWN:
         case WM_LBUTTONUP: {
             char json[128];
+            /* When main is inactive, use server's tracked cursor position (on player) instead of local pt */
+            int click_x = block_local ? (int)g_server.cursor_x : pt.x;
+            int click_y = block_local ? (int)g_server.cursor_y : pt.y;
             snprintf(json, sizeof(json), "{\"action\":\"%s\",\"button\":\"Button.left\",\"x\":%d,\"y\":%d}",
-                     wParam == WM_LBUTTONDOWN ? "press" : "release", pt.x, pt.y);
+                     wParam == WM_LBUTTONDOWN ? "press" : "release", click_x, click_y);
             send_input_event(&g_client, "mouse_click", json);
             break;
         }
         case WM_RBUTTONDOWN:
         case WM_RBUTTONUP: {
             char json[128];
+            int click_x = block_local ? (int)g_server.cursor_x : pt.x;
+            int click_y = block_local ? (int)g_server.cursor_y : pt.y;
             snprintf(json, sizeof(json), "{\"action\":\"%s\",\"button\":\"Button.right\",\"x\":%d,\"y\":%d}",
-                     wParam == WM_RBUTTONDOWN ? "press" : "release", pt.x, pt.y);
+                     wParam == WM_RBUTTONDOWN ? "press" : "release", click_x, click_y);
             send_input_event(&g_client, "mouse_click", json);
             break;
         }
         case WM_MBUTTONDOWN:
         case WM_MBUTTONUP: {
             char json[128];
+            int click_x = block_local ? (int)g_server.cursor_x : pt.x;
+            int click_y = block_local ? (int)g_server.cursor_y : pt.y;
             snprintf(json, sizeof(json), "{\"action\":\"%s\",\"button\":\"Button.middle\",\"x\":%d,\"y\":%d}",
-                     wParam == WM_MBUTTONDOWN ? "press" : "release", pt.x, pt.y);
+                     wParam == WM_MBUTTONDOWN ? "press" : "release", click_x, click_y);
             send_input_event(&g_client, "mouse_click", json);
             break;
         }
@@ -2956,7 +2963,8 @@ static void handle_raw_input(ClientState *client, LPARAM lParam) {
             double now = get_time_ms();
             acc_dx += (int)dx;
             acc_dy += (int)dy;
-            if (now - last_send >= 8) {
+            /* Coalesce deltas for 16ms (~60 Hz) to reduce message rate */
+            if (now - last_send >= 16) {
                 char msg[256];
                 snprintf(msg, sizeof(msg),
                          "{\"type\":\"mouse_delta\",\"device_id\":\"%s\",\"dx\":%d,\"dy\":%d}",
@@ -3699,7 +3707,9 @@ static void server_handle_command(const char *json_data) {
     }
 }
 
-/* Handle mouse delta command from active computer */
+/* Handle mouse delta command from inactive computers forwarding input.
+ * When main is inactive, it captures raw input deltas and sends them here.
+ * We apply these deltas to move the cursor on the currently active computer. */
 static void server_handle_mouse_delta(const char *json_data) {
     char device_id[MAX_HOSTNAME] = "";
     int dx = 0, dy = 0;
@@ -3728,19 +3738,124 @@ static void server_handle_mouse_delta(const char *json_data) {
     }
 
     if (device_id[0] == '\0') return;
-    if (strcmp(device_id, g_server.active_computer_id) != 0) return;
+
+    /* Accept deltas from INACTIVE computers that are forwarding input.
+     * Reject deltas from the active computer (it has local input, doesn't forward).
+     * When main is inactive and player is active, main sends deltas to control player. */
+    if (strcmp(device_id, g_server.active_computer_id) == 0) {
+        LOG_DEBUG("Ignoring delta from active computer %s (has local input)", device_id);
+        return;
+    }
 
     ServerClient *target = server_find_client_by_id(g_server.active_computer_id);
     int screen_w = (target && target->monitor_count > 0) ? target->monitors[0].width : 1920;
     int screen_h = (target && target->monitor_count > 0) ? target->monitors[0].height : 1080;
 
-    g_server.cursor_x += dx;
-    g_server.cursor_y += dy;
+    double old_x = g_server.cursor_x;
+    double old_y = g_server.cursor_y;
+    double new_x = g_server.cursor_x + dx;
+    double new_y = g_server.cursor_y + dy;
 
+    /* Edge detection: check if cursor would go past screen edge */
+    const char *edge_hit = NULL;
+    float edge_position = 0.5f;
+
+    if (new_x < 0) {
+        edge_hit = "left";
+        edge_position = (float)(new_y / screen_h);
+    } else if (new_x >= screen_w) {
+        edge_hit = "right";
+        edge_position = (float)(new_y / screen_h);
+    } else if (new_y < 0) {
+        edge_hit = "top";
+        edge_position = (float)(new_x / screen_w);
+    } else if (new_y >= screen_h) {
+        edge_hit = "bottom";
+        edge_position = (float)(new_x / screen_w);
+    }
+
+    /* If edge hit, trigger switch back to main (device_id is the main computer) */
+    if (edge_hit) {
+        /* Debounce: don't switch too rapidly */
+        double now_ms = get_time_ms();
+        if (g_server.last_edge_crossing_time > 0 &&
+            now_ms - g_server.last_edge_crossing_time < 200) {
+            /* Still clamp and update position but don't switch */
+            g_server.cursor_x = new_x < 0 ? 0 : (new_x >= screen_w ? screen_w - 1 : new_x);
+            g_server.cursor_y = new_y < 0 ? 0 : (new_y >= screen_h ? screen_h - 1 : new_y);
+        } else {
+            g_server.last_edge_crossing_time = now_ms;
+
+            LOG_INFO("Server: Edge hit %s on %s, switching back to %s (pos=%.2f)",
+                     edge_hit, g_server.active_computer_id, device_id, edge_position);
+
+            /* Switch active to the main computer (device_id) */
+            ServerClient *main_client = server_find_client_by_id(device_id);
+            if (main_client && main_client->registered) {
+                /* Calculate entry position on main */
+                int main_w = (main_client->monitor_count > 0) ? main_client->monitors[0].width : 1920;
+                int main_h = (main_client->monitor_count > 0) ? main_client->monitors[0].height : 1080;
+                double entry_x, entry_y;
+
+                if (strcmp(edge_hit, "left") == 0) {
+                    entry_x = main_w - 50;  /* Enter from right of main */
+                    entry_y = edge_position * main_h;
+                } else if (strcmp(edge_hit, "right") == 0) {
+                    entry_x = 50;  /* Enter from left of main */
+                    entry_y = edge_position * main_h;
+                } else if (strcmp(edge_hit, "top") == 0) {
+                    entry_x = edge_position * main_w;
+                    entry_y = main_h - 50;  /* Enter from bottom of main */
+                } else {  /* bottom */
+                    entry_x = edge_position * main_w;
+                    entry_y = 50;  /* Enter from top of main */
+                }
+
+                /* Update server state */
+                strncpy(g_server.active_computer_id, device_id, MAX_HOSTNAME - 1);
+                strcpy(g_server.active_monitor_id, main_client->monitor_count > 0 ?
+                       main_client->monitors[0].monitor_id : "m0");
+                g_server.cursor_x = entry_x;
+                g_server.cursor_y = entry_y;
+
+                LOG_INFO("Server: Switched active to %s:%s cursor=(%.1f, %.1f)",
+                         g_server.active_computer_id, g_server.active_monitor_id, entry_x, entry_y);
+
+                /* Broadcast active monitor change */
+                char switch_msg[512];
+                snprintf(switch_msg, sizeof(switch_msg),
+                         "{\"type\":\"active_monitor_changed\",\"computer_id\":\"%s\",\"monitor_id\":\"%s\","
+                         "\"cursor_x\":%.1f,\"cursor_y\":%.1f}",
+                         g_server.active_computer_id, g_server.active_monitor_id, entry_x, entry_y);
+                queue_server_broadcast(switch_msg, "active_monitor_changed");
+
+                /* Apply locally in embedded server mode */
+                if (g_server.is_server_mode && strcmp(g_client.config.role, "main") == 0) {
+                    apply_active_monitor_changed(&g_client, g_server.active_computer_id,
+                                                 g_server.active_monitor_id, entry_x, entry_y);
+                }
+                return;  /* Don't send mouse_move, we just switched */
+            }
+        }
+    }
+
+    /* Update cursor position (with clamping) */
+    g_server.cursor_x = new_x;
+    g_server.cursor_y = new_y;
     if (g_server.cursor_x < 0) g_server.cursor_x = 0;
     if (g_server.cursor_y < 0) g_server.cursor_y = 0;
     if (g_server.cursor_x > screen_w - 1) g_server.cursor_x = screen_w - 1;
     if (g_server.cursor_y > screen_h - 1) g_server.cursor_y = screen_h - 1;
+
+    /* Log first few deltas and periodic updates */
+    static int delta_count = 0;
+    delta_count++;
+    if (delta_count <= 5 || delta_count % 200 == 0) {
+        LOG_INFO("Delta #%d: from=%s dx=%d dy=%d pos=(%.0f,%.0f)->(%.0f,%.0f) target=%s bounds=(%dx%d)",
+                 delta_count, device_id, dx, dy, old_x, old_y,
+                 g_server.cursor_x, g_server.cursor_y,
+                 g_server.active_computer_id, screen_w, screen_h);
+    }
 
     char msg[512];
     snprintf(msg, sizeof(msg),
