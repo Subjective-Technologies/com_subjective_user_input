@@ -3439,6 +3439,8 @@ static void server_handle_edge_crossing(const char *json_data) {
     char monitor_id[32] = "";
     char edge[16] = "";
     double position = 0.5;
+    int cursor_x = 0;
+    int cursor_y = 0;
 
     const char *cid = strstr(json_data, "\"computer_id\"");
     if (cid) {
@@ -3480,6 +3482,17 @@ static void server_handle_edge_crossing(const char *json_data) {
     if (pos) {
         pos = strchr(pos + 10, ':');
         if (pos) position = atof(pos + 1);
+    }
+
+    const char *cx = strstr(json_data, "\"cursor_x\"");
+    if (cx) {
+        cx = strchr(cx + 10, ':');
+        if (cx) cursor_x = atoi(cx + 1);
+    }
+    const char *cy = strstr(json_data, "\"cursor_y\"");
+    if (cy) {
+        cy = strchr(cy + 10, ':');
+        if (cy) cursor_y = atoi(cy + 1);
     }
 
     LOG_INFO("Server: Edge crossing request from %s:%s edge=%s pos=%.2f cursor=(%d,%d)",
