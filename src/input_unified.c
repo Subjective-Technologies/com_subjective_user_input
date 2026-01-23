@@ -3027,6 +3027,11 @@ struct ws_session_data {
 static void handle_server_message(ClientState *client, const char *msg, size_t len);
 static void send_input_event(ClientState *client, const char *event_type, 
                              const char *json_data);
+static void apply_active_monitor_changed(ClientState *client,
+                                         const char *new_computer,
+                                         const char *new_monitor,
+                                         double cursor_x,
+                                         double cursor_y);
 
 /* WebSocket callback */
 static int ws_callback(struct lws *wsi, enum lws_callback_reasons reason,
