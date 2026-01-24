@@ -1351,6 +1351,51 @@ static void context_ensure_dir(const char *path) {
 #endif
 }
 
+static void context_strlcpy(char *dst, size_t dst_size, const char *src) {
+    if (!dst || dst_size == 0) return;
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+    size_t n = strnlen(src, dst_size - 1);
+    memcpy(dst, src, n);
+    dst[n] = '\0';
+}
+
+static void context_strlcat_n(char *dst, size_t dst_size, const char *src, size_t n) {
+    if (!dst || dst_size == 0 || !src) return;
+    size_t len = strnlen(dst, dst_size);
+    if (len >= dst_size - 1) return;
+    size_t to_copy = dst_size - 1 - len;
+    if (n < to_copy) to_copy = n;
+    memcpy(dst + len, src, to_copy);
+    dst[len + to_copy] = '\0';
+}
+
+static void context_strlcat(char *dst, size_t dst_size, const char *src) {
+    if (!dst || dst_size == 0 || !src) return;
+    size_t len = strnlen(dst, dst_size);
+    if (len >= dst_size - 1) return;
+    size_t to_copy = dst_size - 1 - len;
+    size_t src_len = strnlen(src, to_copy);
+    memcpy(dst + len, src, src_len);
+    dst[len + src_len] = '\0';
+}
+
+static void context_replace_token(char *out, size_t out_size, const char *src,
+                                  const char *token, const char *replacement) {
+    if (!out || out_size == 0 || !src || !token || !replacement) return;
+    const char *pos = strstr(src, token);
+    if (!pos) {
+        context_strlcpy(out, out_size, src);
+        return;
+    }
+    out[0] = '\0';
+    context_strlcat_n(out, out_size, src, (size_t)(pos - src));
+    context_strlcat(out, out_size, replacement);
+    context_strlcat(out, out_size, pos + strlen(token));
+}
+
 static const char* context_get_monitor_id(ClientState *client) {
     if (g_server.is_server_mode && g_server.active_monitor_id[0] != '\0') {
         return g_server.active_monitor_id;
@@ -1856,53 +1901,44 @@ static void context_logger_init(ClientState *client) {
     char filename[512];
     const char *ds = "kvm_input";
     char temp_buf[512];
-    snprintf(temp_buf, sizeof(temp_buf), "%s", ctx->filename_template);
+    context_strlcpy(temp_buf, sizeof(temp_buf), ctx->filename_template);
 
     /* Replace [ds_name] */
-    char *ds_pos = strstr(temp_buf, "[ds_name]");
-    if (ds_pos) {
-        char before[512];
-        size_t prefix_len = (size_t)(ds_pos - temp_buf);
-        strncpy(before, temp_buf, prefix_len);
-        before[prefix_len] = '\0';
-        snprintf(filename, sizeof(filename), "%s%s%s",
-                 before, ds, ds_pos + strlen("[ds_name]"));
-    } else {
-        snprintf(filename, sizeof(filename), "%s", temp_buf);
-    }
+    context_replace_token(filename, sizeof(filename), temp_buf, "[ds_name]", ds);
 
     /* Replace YYYY_MM_DD_HH_MM_SS */
     char final_name[512];
-    char *ts_pos = strstr(filename, "YYYY_MM_DD_HH_MM_SS");
-    if (ts_pos) {
-        char before[512];
-        size_t prefix_len = (size_t)(ts_pos - filename);
-        strncpy(before, filename, prefix_len);
-        before[prefix_len] = '\0';
-        snprintf(final_name, sizeof(final_name), "%s%s%s",
-                 before, timestamp, ts_pos + strlen("YYYY_MM_DD_HH_MM_SS"));
-    } else {
-        snprintf(final_name, sizeof(final_name), "%s", filename);
-    }
+    context_replace_token(final_name, sizeof(final_name), filename,
+                          "YYYY_MM_DD_HH_MM_SS", timestamp);
 
     /* Ensure unique filename if it already exists */
-    snprintf(ctx->file_path, sizeof(ctx->file_path), "%s/%s", ctx->dir_path, final_name);
+    ctx->file_path[0] = '\0';
+    context_strlcat(ctx->file_path, sizeof(ctx->file_path), ctx->dir_path);
+    context_strlcat(ctx->file_path, sizeof(ctx->file_path), "/");
+    context_strlcat(ctx->file_path, sizeof(ctx->file_path), final_name);
     if (context_file_exists(ctx->file_path)) {
         char base[512];
         char ext[64] = "";
         char *dot = strrchr(final_name, '.');
         if (dot) {
             size_t base_len = (size_t)(dot - final_name);
-            strncpy(base, final_name, base_len);
-            base[base_len] = '\0';
-            snprintf(ext, sizeof(ext), "%s", dot);
+            context_strlcpy(base, sizeof(base), "");
+            context_strlcat_n(base, sizeof(base), final_name, base_len);
+            context_strlcpy(ext, sizeof(ext), dot);
         } else {
-            snprintf(base, sizeof(base), "%s", final_name);
+            context_strlcpy(base, sizeof(base), final_name);
         }
 
         for (int i = 2; i < 1000; i++) {
-            snprintf(ctx->file_path, sizeof(ctx->file_path), "%s/%s-%d%s",
-                     ctx->dir_path, base, i, ext);
+            char num_buf[16];
+            snprintf(num_buf, sizeof(num_buf), "%d", i);
+            ctx->file_path[0] = '\0';
+            context_strlcat(ctx->file_path, sizeof(ctx->file_path), ctx->dir_path);
+            context_strlcat(ctx->file_path, sizeof(ctx->file_path), "/");
+            context_strlcat(ctx->file_path, sizeof(ctx->file_path), base);
+            context_strlcat(ctx->file_path, sizeof(ctx->file_path), "-");
+            context_strlcat(ctx->file_path, sizeof(ctx->file_path), num_buf);
+            context_strlcat(ctx->file_path, sizeof(ctx->file_path), ext);
             if (!context_file_exists(ctx->file_path)) break;
         }
     }
