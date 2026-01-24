@@ -2352,6 +2352,31 @@ static void close_evdev_devices(int *fds, int count) {
 
 #ifdef PLATFORM_LINUX
 
+typedef struct {
+    KeyCode keycode;
+    bool need_shift;
+    bool need_altgr;
+} KeyCodeWithMods;
+
+static bool find_keycode_with_mods(Display *display, KeySym keysym, KeyCodeWithMods *out) {
+    int min_keycode = 0;
+    int max_keycode = 0;
+    XDisplayKeycodes(display, &min_keycode, &max_keycode);
+
+    for (int code = min_keycode; code <= max_keycode; code++) {
+        for (int level = 0; level <= 3; level++) {
+            KeySym sym = XkbKeycodeToKeysym(display, (KeyCode)code, 0, level);
+            if (sym == keysym) {
+                out->keycode = (KeyCode)code;
+                out->need_shift = (level == 1 || level == 3);
+                out->need_altgr = (level == 2 || level == 3);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static void inject_key_linux(Display *display, const char *key, bool is_special, bool press) {
     if (!display) return;
     
@@ -2450,12 +2475,46 @@ static void inject_key_linux(Display *display, const char *key, bool is_special,
         return;
     }
     
+    KeyCodeWithMods mapped = {0};
+    bool has_mapping = false;
+    if (!is_special) {
+        has_mapping = find_keycode_with_mods(display, keysym, &mapped);
+    }
+
+    if (has_mapping && mapped.keycode != 0) {
+        KeyCode shift_code = XKeysymToKeycode(display, XK_Shift_L);
+        KeyCode altgr_code = XKeysymToKeycode(display, XK_ISO_Level3_Shift);
+        if (altgr_code == 0) {
+            altgr_code = XKeysymToKeycode(display, XK_Alt_R);
+        }
+
+        if (press) {
+            if (mapped.need_shift && shift_code) {
+                XTestFakeKeyEvent(display, shift_code, True, CurrentTime);
+            }
+            if (mapped.need_altgr && altgr_code) {
+                XTestFakeKeyEvent(display, altgr_code, True, CurrentTime);
+            }
+            XTestFakeKeyEvent(display, mapped.keycode, True, CurrentTime);
+        } else {
+            XTestFakeKeyEvent(display, mapped.keycode, False, CurrentTime);
+            if (mapped.need_altgr && altgr_code) {
+                XTestFakeKeyEvent(display, altgr_code, False, CurrentTime);
+            }
+            if (mapped.need_shift && shift_code) {
+                XTestFakeKeyEvent(display, shift_code, False, CurrentTime);
+            }
+        }
+        XFlush(display);
+        return;
+    }
+
     KeyCode keycode = XKeysymToKeycode(display, keysym);
     if (keycode == 0) {
         LOG_WARN("No keycode for keysym: %s", key);
         return;
     }
-    
+
     XTestFakeKeyEvent(display, keycode, press ? True : False, CurrentTime);
     XFlush(display);
 }
