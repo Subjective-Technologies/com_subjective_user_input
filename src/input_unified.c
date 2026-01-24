@@ -141,6 +141,13 @@
 #define MSG_QUEUE_SIZE 256   /* Queue size (reduced since msgs are larger now) */
 #define MSG_MAX_LEN 8192     /* 8KB max message length - needed for clipboard! */
 
+/* Context logging aggregation thresholds */
+#define CONTEXT_TEXT_IDLE_MS 400
+#define CONTEXT_TEXT_MAX_AGE_MS 3000
+#define CONTEXT_TEXT_MAX_LEN 200
+#define CONTEXT_MOUSE_WINDOW_MS 250
+#define CONTEXT_TEXT_BUF_CAP 512
+
 /* Log levels */
 typedef enum {
     LOG_DEBUG = 0,
@@ -177,6 +184,9 @@ typedef struct {
     int port;
     bool use_ssl;
     LogLevel log_level;
+    char context_path[512];
+    char context_format[16];
+    char context_template[256];
 } ClientConfig;
 
 /* Input event data */
@@ -191,6 +201,50 @@ typedef struct {
     int dy;
     char button[32];
 } InputEventData;
+
+/* Context logging for Subjective */
+typedef struct {
+    FILE *file;
+    bool enabled;
+    bool has_entries;
+    char file_path[1024];
+    char dir_path[512];
+    char format[16];
+    char filename_template[256];
+
+    /* Text aggregation */
+    char text_buf[512];
+    size_t text_len;
+    double text_start_mono_ms;
+    double text_last_mono_ms;
+    double text_start_wall_ms;
+    double text_last_wall_ms;
+    bool ctrl_down;
+    bool alt_down;
+    bool meta_down;
+
+    /* Mouse aggregation */
+    bool mouse_active;
+    int mouse_start_x;
+    int mouse_start_y;
+    int mouse_last_x;
+    int mouse_last_y;
+    double mouse_total_distance;
+    int mouse_sample_count;
+    double mouse_start_mono_ms;
+    double mouse_last_mono_ms;
+    double mouse_start_wall_ms;
+    double mouse_last_wall_ms;
+
+#ifdef PLATFORM_LINUX
+    pthread_mutex_t mutex;
+    bool mutex_initialized;
+#endif
+#ifdef PLATFORM_WINDOWS
+    CRITICAL_SECTION cs;
+    bool cs_initialized;
+#endif
+} ContextLogger;
 
 /* Thread-safe message queue for WebSocket sending */
 typedef struct {
@@ -243,6 +297,9 @@ typedef struct {
     
     /* Thread-safe message queue for input events */
     MessageQueue msg_queue;
+
+    /* Subjective context logger */
+    ContextLogger context_logger;
     
     /* Platform-specific handles */
 #ifdef PLATFORM_LINUX
@@ -1210,11 +1267,689 @@ static double get_time_ms(void) {
 #endif
 }
 
+/* Wall-clock time in milliseconds since Unix epoch */
+static double get_wall_time_ms(void) {
+#ifdef PLATFORM_WINDOWS
+    FILETIME ft;
+    ULARGE_INTEGER uli;
+    GetSystemTimeAsFileTime(&ft);
+    uli.LowPart = ft.dwLowDateTime;
+    uli.HighPart = ft.dwHighDateTime;
+    /* FILETIME is 100-nanosecond intervals since 1601-01-01 */
+    const uint64_t EPOCH_DIFF_100NS = 116444736000000000ULL;
+    uint64_t time_100ns = uli.QuadPart;
+    if (time_100ns < EPOCH_DIFF_100NS) {
+        return 0.0;
+    }
+    uint64_t unix_100ns = time_100ns - EPOCH_DIFF_100NS;
+    return (double)(unix_100ns / 10000ULL);
+#else
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec / 1000.0;
+#endif
+}
+
+static void format_iso8601_ms(double wall_ms, char *out, size_t out_size) {
+    time_t sec = (time_t)(wall_ms / 1000.0);
+    int ms = (int)((long long)wall_ms % 1000);
+    struct tm tm_utc;
+#ifdef PLATFORM_WINDOWS
+    gmtime_s(&tm_utc, &sec);
+#else
+    gmtime_r(&sec, &tm_utc);
+#endif
+    snprintf(out, out_size, "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+             tm_utc.tm_year + 1900, tm_utc.tm_mon + 1, tm_utc.tm_mday,
+             tm_utc.tm_hour, tm_utc.tm_min, tm_utc.tm_sec, ms);
+}
+
 static void sleep_ms(int ms) {
 #ifdef PLATFORM_WINDOWS
     Sleep(ms);
 #else
     usleep(ms * 1000);
+#endif
+}
+
+/* ============================================================================
+ * Context Logging (Subjective)
+ * ============================================================================ */
+
+static void context_lock(ContextLogger *ctx) {
+#ifdef PLATFORM_LINUX
+    if (ctx->mutex_initialized) pthread_mutex_lock(&ctx->mutex);
+#endif
+#ifdef PLATFORM_WINDOWS
+    if (ctx->cs_initialized) EnterCriticalSection(&ctx->cs);
+#endif
+}
+
+static void context_unlock(ContextLogger *ctx) {
+#ifdef PLATFORM_LINUX
+    if (ctx->mutex_initialized) pthread_mutex_unlock(&ctx->mutex);
+#endif
+#ifdef PLATFORM_WINDOWS
+    if (ctx->cs_initialized) LeaveCriticalSection(&ctx->cs);
+#endif
+}
+
+static bool context_file_exists(const char *path) {
+    struct stat st;
+    return (stat(path, &st) == 0);
+}
+
+static void context_ensure_dir(const char *path) {
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        return;
+    }
+#ifdef PLATFORM_WINDOWS
+    _mkdir(path);
+#else
+    mkdir(path, 0755);
+#endif
+}
+
+static const char* context_get_monitor_id(ClientState *client) {
+    if (g_server.is_server_mode && g_server.active_monitor_id[0] != '\0') {
+        return g_server.active_monitor_id;
+    }
+    if (client->monitor_count > 0 && client->monitors[0].monitor_id[0] != '\0') {
+        return client->monitors[0].monitor_id;
+    }
+    return "m0";
+}
+
+static void context_append_event(ContextLogger *ctx, const char *event_json) {
+    if (!ctx->enabled || !ctx->file) return;
+
+    /* Keep JSON array valid: always overwrite trailing "]\n" */
+    if (fseek(ctx->file, 0, SEEK_END) != 0) {
+        return;
+    }
+    long size = ftell(ctx->file);
+    if (size < 2) {
+        fseek(ctx->file, 0, SEEK_SET);
+        fputs("[\n]\n", ctx->file);
+        fflush(ctx->file);
+        size = 4;
+    }
+
+    if (fseek(ctx->file, -2, SEEK_END) != 0) {
+        return;
+    }
+
+    if (ctx->has_entries) {
+        fprintf(ctx->file, ",\n  %s\n]\n", event_json);
+    } else {
+        fprintf(ctx->file, "  %s\n]\n", event_json);
+    }
+    fflush(ctx->file);
+    ctx->has_entries = true;
+}
+
+static void context_reset_text(ContextLogger *ctx) {
+    ctx->text_len = 0;
+    ctx->text_buf[0] = '\0';
+    ctx->text_start_mono_ms = 0;
+    ctx->text_last_mono_ms = 0;
+    ctx->text_start_wall_ms = 0;
+    ctx->text_last_wall_ms = 0;
+}
+
+static void context_reset_mouse(ContextLogger *ctx) {
+    ctx->mouse_active = false;
+    ctx->mouse_sample_count = 0;
+    ctx->mouse_total_distance = 0.0;
+    ctx->mouse_start_mono_ms = 0;
+    ctx->mouse_last_mono_ms = 0;
+    ctx->mouse_start_wall_ms = 0;
+    ctx->mouse_last_wall_ms = 0;
+}
+
+static void context_flush_text(ClientState *client) {
+    ContextLogger *ctx = &client->context_logger;
+    if (!ctx->enabled || ctx->text_len == 0) return;
+
+    char start_ts[64];
+    char end_ts[64];
+    format_iso8601_ms(ctx->text_start_wall_ms, start_ts, sizeof(start_ts));
+    format_iso8601_ms(ctx->text_last_wall_ms, end_ts, sizeof(end_ts));
+
+    StringBuilder sb;
+    sb_init(&sb);
+    sb_append(&sb, "{");
+    sb_append(&sb, "\"event_type\":\"text_input\",");
+    sb_append(&sb, "\"start_ts\":\"");
+    sb_append(&sb, start_ts);
+    sb_append(&sb, "\",");
+    sb_append(&sb, "\"end_ts\":\"");
+    sb_append(&sb, end_ts);
+    sb_append(&sb, "\",");
+    sb_append(&sb, "\"text\":");
+    sb_append_escaped(&sb, ctx->text_buf);
+    sb_append(&sb, ",");
+    char numbuf[64];
+    snprintf(numbuf, sizeof(numbuf), "\"char_count\":%zu", ctx->text_len);
+    sb_append(&sb, numbuf);
+    sb_append(&sb, ",\"computer_id\":");
+    sb_append_escaped(&sb, client->config.computer_id);
+    sb_append(&sb, ",\"monitor_id\":");
+    sb_append_escaped(&sb, context_get_monitor_id(client));
+    sb_append(&sb, "}");
+
+    context_append_event(ctx, sb.buf);
+    free(sb.buf);
+    context_reset_text(ctx);
+}
+
+static void context_flush_mouse(ClientState *client) {
+    ContextLogger *ctx = &client->context_logger;
+    if (!ctx->enabled || !ctx->mouse_active || ctx->mouse_sample_count <= 0) return;
+
+    char start_ts[64];
+    char end_ts[64];
+    format_iso8601_ms(ctx->mouse_start_wall_ms, start_ts, sizeof(start_ts));
+    format_iso8601_ms(ctx->mouse_last_wall_ms, end_ts, sizeof(end_ts));
+
+    StringBuilder sb;
+    sb_init(&sb);
+    sb_append(&sb, "{");
+    sb_append(&sb, "\"event_type\":\"mouse_move\",");
+    sb_append(&sb, "\"start_ts\":\"");
+    sb_append(&sb, start_ts);
+    sb_append(&sb, "\",");
+    sb_append(&sb, "\"end_ts\":\"");
+    sb_append(&sb, end_ts);
+    sb_append(&sb, "\",");
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "\"start_pos\":{\"x\":%d,\"y\":%d},"
+             "\"end_pos\":{\"x\":%d,\"y\":%d},"
+             "\"total_distance\":%.2f,"
+             "\"sample_count\":%d",
+             ctx->mouse_start_x, ctx->mouse_start_y,
+             ctx->mouse_last_x, ctx->mouse_last_y,
+             ctx->mouse_total_distance, ctx->mouse_sample_count);
+    sb_append(&sb, buf);
+    sb_append(&sb, ",\"computer_id\":");
+    sb_append_escaped(&sb, client->config.computer_id);
+    sb_append(&sb, ",\"monitor_id\":");
+    sb_append_escaped(&sb, context_get_monitor_id(client));
+    sb_append(&sb, "}");
+
+    context_append_event(ctx, sb.buf);
+    free(sb.buf);
+    context_reset_mouse(ctx);
+}
+
+static bool context_key_is_modifier(const char *key_name) {
+    if (!key_name) return false;
+    char lower[64];
+    size_t len = strlen(key_name);
+    if (len >= sizeof(lower)) len = sizeof(lower) - 1;
+    for (size_t i = 0; i < len; i++) {
+        char c = key_name[i];
+        lower[i] = (char)((c >= 'A' && c <= 'Z') ? (c - 'A' + 'a') : c);
+    }
+    lower[len] = '\0';
+    return (strstr(lower, "ctrl") != NULL ||
+            strstr(lower, "control") != NULL ||
+            strstr(lower, "alt") != NULL ||
+            strstr(lower, "meta") != NULL ||
+            strstr(lower, "cmd") != NULL);
+}
+
+static void context_update_modifier(ContextLogger *ctx, const char *key_name, bool is_down) {
+    if (!key_name) return;
+    char lower[64];
+    size_t len = strlen(key_name);
+    if (len >= sizeof(lower)) len = sizeof(lower) - 1;
+    for (size_t i = 0; i < len; i++) {
+        char c = key_name[i];
+        lower[i] = (char)((c >= 'A' && c <= 'Z') ? (c - 'A' + 'a') : c);
+    }
+    lower[len] = '\0';
+
+    if (strstr(lower, "ctrl") != NULL || strstr(lower, "control") != NULL) {
+        ctx->ctrl_down = is_down;
+    } else if (strstr(lower, "alt") != NULL) {
+        ctx->alt_down = is_down;
+    } else if (strstr(lower, "cmd") != NULL || strstr(lower, "meta") != NULL) {
+        ctx->meta_down = is_down;
+    }
+}
+
+static bool context_key_to_text(const char *key_name, bool is_special, char *out_char) {
+    if (!key_name) return false;
+    if (strcmp(key_name, "Key.space") == 0) {
+        *out_char = ' ';
+        return true;
+    }
+    if (is_special) return false;
+    if (strlen(key_name) != 1) return false;
+    unsigned char c = (unsigned char)key_name[0];
+    if (c < 32 || c > 126) return false;
+    *out_char = (char)c;
+    return true;
+}
+
+static void context_handle_key_event(ClientState *client, const char *key_name,
+                                     bool is_special, bool is_press) {
+    ContextLogger *ctx = &client->context_logger;
+    if (!ctx->enabled || !is_press) return;
+
+    context_lock(ctx);
+
+    if (context_key_is_modifier(key_name)) {
+        context_update_modifier(ctx, key_name, true);
+    }
+
+    double now_mono = get_time_ms();
+    double now_wall = get_wall_time_ms();
+
+    /* Flush if idle or too old before appending */
+    if (ctx->text_len > 0) {
+        if ((now_mono - ctx->text_last_mono_ms) >= CONTEXT_TEXT_IDLE_MS ||
+            (now_mono - ctx->text_start_mono_ms) >= CONTEXT_TEXT_MAX_AGE_MS) {
+            context_flush_text(client);
+        }
+    }
+
+    char ch = 0;
+    bool is_text = context_key_to_text(key_name, is_special, &ch);
+    if (ctx->ctrl_down || ctx->alt_down || ctx->meta_down) {
+        is_text = false;
+    }
+
+    if (is_text) {
+        if (ctx->text_len + 1 > CONTEXT_TEXT_MAX_LEN) {
+            context_flush_text(client);
+        }
+        if (ctx->text_len == 0) {
+            ctx->text_start_mono_ms = now_mono;
+            ctx->text_start_wall_ms = now_wall;
+        }
+        if (ctx->text_len < CONTEXT_TEXT_BUF_CAP - 1) {
+            ctx->text_buf[ctx->text_len++] = ch;
+            ctx->text_buf[ctx->text_len] = '\0';
+            ctx->text_last_mono_ms = now_mono;
+            ctx->text_last_wall_ms = now_wall;
+        }
+    } else {
+        context_flush_text(client);
+    }
+
+    context_unlock(ctx);
+}
+
+static void context_handle_key_modifier_release(ClientState *client, const char *key_name) {
+    ContextLogger *ctx = &client->context_logger;
+    if (!ctx->enabled) return;
+
+    context_lock(ctx);
+    if (context_key_is_modifier(key_name)) {
+        context_update_modifier(ctx, key_name, false);
+    }
+    context_unlock(ctx);
+}
+
+static void context_handle_mouse_move(ClientState *client, int x, int y) {
+    ContextLogger *ctx = &client->context_logger;
+    if (!ctx->enabled) return;
+
+    context_lock(ctx);
+
+    double now_mono = get_time_ms();
+    double now_wall = get_wall_time_ms();
+
+    if (!ctx->mouse_active) {
+        ctx->mouse_active = true;
+        ctx->mouse_start_x = x;
+        ctx->mouse_start_y = y;
+        ctx->mouse_last_x = x;
+        ctx->mouse_last_y = y;
+        ctx->mouse_total_distance = 0.0;
+        ctx->mouse_sample_count = 1;
+        ctx->mouse_start_mono_ms = now_mono;
+        ctx->mouse_last_mono_ms = now_mono;
+        ctx->mouse_start_wall_ms = now_wall;
+        ctx->mouse_last_wall_ms = now_wall;
+        context_unlock(ctx);
+        return;
+    }
+
+    /* Flush if window exceeded */
+    if ((now_mono - ctx->mouse_start_mono_ms) >= CONTEXT_MOUSE_WINDOW_MS) {
+        context_flush_mouse(client);
+        /* start new window with current point */
+        ctx->mouse_active = true;
+        ctx->mouse_start_x = x;
+        ctx->mouse_start_y = y;
+        ctx->mouse_last_x = x;
+        ctx->mouse_last_y = y;
+        ctx->mouse_total_distance = 0.0;
+        ctx->mouse_sample_count = 1;
+        ctx->mouse_start_mono_ms = now_mono;
+        ctx->mouse_last_mono_ms = now_mono;
+        ctx->mouse_start_wall_ms = now_wall;
+        ctx->mouse_last_wall_ms = now_wall;
+        context_unlock(ctx);
+        return;
+    }
+
+    int dx = x - ctx->mouse_last_x;
+    int dy = y - ctx->mouse_last_y;
+    ctx->mouse_total_distance += sqrt((double)(dx * dx + dy * dy));
+    ctx->mouse_last_x = x;
+    ctx->mouse_last_y = y;
+    ctx->mouse_last_mono_ms = now_mono;
+    ctx->mouse_last_wall_ms = now_wall;
+    ctx->mouse_sample_count++;
+
+    context_unlock(ctx);
+}
+
+static void context_handle_mouse_click(ClientState *client, int x, int y,
+                                       const char *button, const char *action) {
+    ContextLogger *ctx = &client->context_logger;
+    if (!ctx->enabled) return;
+
+    context_lock(ctx);
+    context_flush_mouse(client);
+
+    double now_wall = get_wall_time_ms();
+    char ts[64];
+    format_iso8601_ms(now_wall, ts, sizeof(ts));
+
+    StringBuilder sb;
+    sb_init(&sb);
+    sb_append(&sb, "{");
+    sb_append(&sb, "\"event_type\":\"mouse_click\",");
+    sb_append(&sb, "\"start_ts\":\"");
+    sb_append(&sb, ts);
+    sb_append(&sb, "\",");
+    sb_append(&sb, "\"end_ts\":\"");
+    sb_append(&sb, ts);
+    sb_append(&sb, "\",");
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "\"x\":%d,\"y\":%d,\"button\":\"%s\",\"action\":\"%s\"",
+             x, y, button ? button : "", action ? action : "");
+    sb_append(&sb, buf);
+    sb_append(&sb, ",\"computer_id\":");
+    sb_append_escaped(&sb, client->config.computer_id);
+    sb_append(&sb, ",\"monitor_id\":");
+    sb_append_escaped(&sb, context_get_monitor_id(client));
+    sb_append(&sb, "}");
+
+    context_append_event(ctx, sb.buf);
+    free(sb.buf);
+    context_unlock(ctx);
+}
+
+static void context_handle_mouse_scroll(ClientState *client, int x, int y, int dx, int dy) {
+    ContextLogger *ctx = &client->context_logger;
+    if (!ctx->enabled) return;
+
+    context_lock(ctx);
+    context_flush_mouse(client);
+
+    double now_wall = get_wall_time_ms();
+    char ts[64];
+    format_iso8601_ms(now_wall, ts, sizeof(ts));
+
+    StringBuilder sb;
+    sb_init(&sb);
+    sb_append(&sb, "{");
+    sb_append(&sb, "\"event_type\":\"mouse_scroll\",");
+    sb_append(&sb, "\"start_ts\":\"");
+    sb_append(&sb, ts);
+    sb_append(&sb, "\",");
+    sb_append(&sb, "\"end_ts\":\"");
+    sb_append(&sb, ts);
+    sb_append(&sb, "\",");
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "\"x\":%d,\"y\":%d,\"dx\":%d,\"dy\":%d",
+             x, y, dx, dy);
+    sb_append(&sb, buf);
+    sb_append(&sb, ",\"computer_id\":");
+    sb_append_escaped(&sb, client->config.computer_id);
+    sb_append(&sb, ",\"monitor_id\":");
+    sb_append_escaped(&sb, context_get_monitor_id(client));
+    sb_append(&sb, "}");
+
+    context_append_event(ctx, sb.buf);
+    free(sb.buf);
+    context_unlock(ctx);
+}
+
+static uint32_t context_hash_fnv1a(const char *data, size_t len) {
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < len; i++) {
+        hash ^= (unsigned char)data[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static void context_handle_clipboard_update(ClientState *client, const char *content, size_t len) {
+    ContextLogger *ctx = &client->context_logger;
+    if (!ctx->enabled) return;
+
+    context_lock(ctx);
+
+    double now_wall = get_wall_time_ms();
+    char ts[64];
+    format_iso8601_ms(now_wall, ts, sizeof(ts));
+
+    uint32_t hash = context_hash_fnv1a(content, len);
+    char hash_hex[16];
+    snprintf(hash_hex, sizeof(hash_hex), "%08x", hash);
+
+    StringBuilder sb;
+    sb_init(&sb);
+    sb_append(&sb, "{");
+    sb_append(&sb, "\"event_type\":\"clipboard_update\",");
+    sb_append(&sb, "\"start_ts\":\"");
+    sb_append(&sb, ts);
+    sb_append(&sb, "\",");
+    sb_append(&sb, "\"end_ts\":\"");
+    sb_append(&sb, ts);
+    sb_append(&sb, "\",");
+    char buf[128];
+    snprintf(buf, sizeof(buf), "\"size\":%zu,\"hash\":\"%s\"", len, hash_hex);
+    sb_append(&sb, buf);
+    if (content && len > 0 && len <= 2048) {
+        sb_append(&sb, ",\"content\":");
+        sb_append_escaped(&sb, content);
+    }
+    sb_append(&sb, ",\"computer_id\":");
+    sb_append_escaped(&sb, client->config.computer_id);
+    sb_append(&sb, ",\"monitor_id\":");
+    sb_append_escaped(&sb, context_get_monitor_id(client));
+    sb_append(&sb, "}");
+
+    context_append_event(ctx, sb.buf);
+    free(sb.buf);
+
+    context_unlock(ctx);
+}
+
+static void context_tick(ClientState *client) {
+    ContextLogger *ctx = &client->context_logger;
+    if (!ctx->enabled) return;
+
+    context_lock(ctx);
+    double now_mono = get_time_ms();
+
+    if (ctx->text_len > 0) {
+        if ((now_mono - ctx->text_last_mono_ms) >= CONTEXT_TEXT_IDLE_MS ||
+            (now_mono - ctx->text_start_mono_ms) >= CONTEXT_TEXT_MAX_AGE_MS) {
+            context_flush_text(client);
+        }
+    }
+
+    if (ctx->mouse_active && ctx->mouse_sample_count > 0) {
+        if ((now_mono - ctx->mouse_start_mono_ms) >= CONTEXT_MOUSE_WINDOW_MS) {
+            context_flush_mouse(client);
+        }
+    }
+    context_unlock(ctx);
+}
+
+static void context_logger_init(ClientState *client) {
+    ContextLogger *ctx = &client->context_logger;
+    memset(ctx, 0, sizeof(ContextLogger));
+
+#ifdef PLATFORM_LINUX
+    pthread_mutex_init(&ctx->mutex, NULL);
+    ctx->mutex_initialized = true;
+#endif
+#ifdef PLATFORM_WINDOWS
+    InitializeCriticalSection(&ctx->cs);
+    ctx->cs_initialized = true;
+#endif
+
+    const char *format = client->config.context_format[0] ? client->config.context_format : "json";
+    strncpy(ctx->format, format, sizeof(ctx->format) - 1);
+    for (size_t i = 0; ctx->format[i] != '\0'; i++) {
+        if (ctx->format[i] >= 'A' && ctx->format[i] <= 'Z') {
+            ctx->format[i] = (char)(ctx->format[i] - 'A' + 'a');
+        }
+    }
+
+    if (strcmp(ctx->format, "json") != 0) {
+        LOG_WARN("Context format '%s' not supported; context logging disabled", ctx->format);
+        return;
+    }
+
+    const char *dir = NULL;
+    if (client->config.context_path[0]) {
+        dir = client->config.context_path;
+    } else {
+        const char *env_ctx = getenv("CONTEXT_FOLDER_PATH");
+        if (env_ctx && env_ctx[0]) {
+            dir = env_ctx;
+        } else {
+            const char *env_logs = getenv("LOGS_FOLDER_PATH");
+            dir = (env_logs && env_logs[0]) ? env_logs : "logs";
+        }
+    }
+
+    strncpy(ctx->dir_path, dir, sizeof(ctx->dir_path) - 1);
+    context_ensure_dir(ctx->dir_path);
+
+    const char *tmpl = client->config.context_template[0]
+                           ? client->config.context_template
+                           : "YYYY_MM_DD_HH_MM_SS-[ds_name]-context.json";
+    strncpy(ctx->filename_template, tmpl, sizeof(ctx->filename_template) - 1);
+
+    /* Build filename from template */
+    char timestamp[32];
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    strftime(timestamp, sizeof(timestamp), "%Y_%m_%d_%H_%M_%S", tm_info);
+
+    char filename[512];
+    const char *ds = "kvm_input";
+    char temp_buf[512];
+    snprintf(temp_buf, sizeof(temp_buf), "%s", ctx->filename_template);
+
+    /* Replace [ds_name] */
+    char *ds_pos = strstr(temp_buf, "[ds_name]");
+    if (ds_pos) {
+        char before[512];
+        size_t prefix_len = (size_t)(ds_pos - temp_buf);
+        strncpy(before, temp_buf, prefix_len);
+        before[prefix_len] = '\0';
+        snprintf(filename, sizeof(filename), "%s%s%s",
+                 before, ds, ds_pos + strlen("[ds_name]"));
+    } else {
+        snprintf(filename, sizeof(filename), "%s", temp_buf);
+    }
+
+    /* Replace YYYY_MM_DD_HH_MM_SS */
+    char final_name[512];
+    char *ts_pos = strstr(filename, "YYYY_MM_DD_HH_MM_SS");
+    if (ts_pos) {
+        char before[512];
+        size_t prefix_len = (size_t)(ts_pos - filename);
+        strncpy(before, filename, prefix_len);
+        before[prefix_len] = '\0';
+        snprintf(final_name, sizeof(final_name), "%s%s%s",
+                 before, timestamp, ts_pos + strlen("YYYY_MM_DD_HH_MM_SS"));
+    } else {
+        snprintf(final_name, sizeof(final_name), "%s", filename);
+    }
+
+    /* Ensure unique filename if it already exists */
+    snprintf(ctx->file_path, sizeof(ctx->file_path), "%s/%s", ctx->dir_path, final_name);
+    if (context_file_exists(ctx->file_path)) {
+        char base[512];
+        char ext[64] = "";
+        char *dot = strrchr(final_name, '.');
+        if (dot) {
+            size_t base_len = (size_t)(dot - final_name);
+            strncpy(base, final_name, base_len);
+            base[base_len] = '\0';
+            snprintf(ext, sizeof(ext), "%s", dot);
+        } else {
+            snprintf(base, sizeof(base), "%s", final_name);
+        }
+
+        for (int i = 2; i < 1000; i++) {
+            snprintf(ctx->file_path, sizeof(ctx->file_path), "%s/%s-%d%s",
+                     ctx->dir_path, base, i, ext);
+            if (!context_file_exists(ctx->file_path)) break;
+        }
+    }
+
+    ctx->file = fopen(ctx->file_path, "wb+");
+    if (!ctx->file) {
+        LOG_ERROR("Failed to open context file: %s (%s)", ctx->file_path, strerror(errno));
+        return;
+    }
+
+    setvbuf(ctx->file, NULL, _IOFBF, 64 * 1024);
+    fputs("[\n]\n", ctx->file);
+    fflush(ctx->file);
+
+    ctx->enabled = true;
+    ctx->has_entries = false;
+    context_reset_text(ctx);
+    context_reset_mouse(ctx);
+
+    LOG_INFO("Context logging enabled: %s", ctx->file_path);
+}
+
+static void context_logger_shutdown(ClientState *client) {
+    ContextLogger *ctx = &client->context_logger;
+    if (ctx->enabled) {
+        context_lock(ctx);
+        context_flush_text(client);
+        context_flush_mouse(client);
+        if (ctx->file) {
+            fclose(ctx->file);
+            ctx->file = NULL;
+        }
+        ctx->enabled = false;
+        context_unlock(ctx);
+    }
+
+#ifdef PLATFORM_LINUX
+    if (ctx->mutex_initialized) {
+        pthread_mutex_destroy(&ctx->mutex);
+        ctx->mutex_initialized = false;
+    }
+#endif
+#ifdef PLATFORM_WINDOWS
+    if (ctx->cs_initialized) {
+        DeleteCriticalSection(&ctx->cs);
+        ctx->cs_initialized = false;
+    }
 #endif
 }
 
@@ -1964,6 +2699,9 @@ static void* clipboard_monitor_thread(void *arg) {
             if (current_len < sizeof(client->last_clipboard)) {
                 memcpy(client->last_clipboard, current, current_len + 1);
                 client->last_clipboard_len = current_len;
+
+                /* Log clipboard change to context */
+                context_handle_clipboard_update(client, current, current_len);
                 
                 /* Send clipboard update to server */
                 if (current_len > 0 && current_len < CLIPBOARD_MAX_SIZE) {
@@ -2367,6 +3105,11 @@ static void xrecord_callback(XPointer priv, XRecordInterceptData *data) {
                 is_press ? "press" : "release",
                 key_name,
                 is_special ? "true" : "false");
+            if (is_press) {
+                context_handle_key_event(ctx->client, key_name, is_special, true);
+            } else {
+                context_handle_key_modifier_release(ctx->client, key_name);
+            }
             send_input_event(ctx->client, "keyboard", json);
             
             /* Log first 5 keys and then every 50 */
@@ -2411,6 +3154,7 @@ static void xrecord_callback(XPointer priv, XRecordInterceptData *data) {
                 snprintf(json, sizeof(json),
                     "{\"x\":%d,\"y\":%d,\"dx\":%d,\"dy\":%d}",
                     root_x, root_y, dx, dy);
+                context_handle_mouse_scroll(ctx->client, root_x, root_y, dx, dy);
                 send_input_event(ctx->client, "mouse_scroll", json);
                 
                 /* Log first 3 scrolls and then every 20 */
@@ -2703,6 +3447,25 @@ static void send_edge_crossing_request(ClientState *client, const char *edge,
 static void send_mouse_move_fast(ClientState *client, int x, int y, double now_ms);
 static void queue_server_command(const char *msg, const char *tag);
 
+static bool vk_to_printable_char(DWORD vk, char *out_char) {
+    BYTE state[256];
+    if (!GetKeyboardState(state)) {
+        return false;
+    }
+    UINT scan = MapVirtualKey(vk, MAPVK_VK_TO_VSC);
+    WCHAR buf[4] = {0};
+    HKL layout = GetKeyboardLayout(0);
+    int ret = ToUnicodeEx(vk, scan, state, buf, 4, 0, layout);
+    if (ret == 1) {
+        WCHAR wc = buf[0];
+        if (wc >= 32 && wc <= 126) {
+            *out_char = (char)wc;
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Windows low-level keyboard hook */
 static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode >= 0 && g_client.running && strcmp(g_client.config.role, "main") == 0) {
@@ -2719,52 +3482,64 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lP
         } else if (kb->vkCode >= '0' && kb->vkCode <= '9') {
             snprintf(key_name, sizeof(key_name), "%c", (char)kb->vkCode);
         } else {
-            /* Map special keys */
-            is_special = true;
-            switch (kb->vkCode) {
-                case VK_RETURN: strcpy(key_name, "Key.enter"); break;
-                case VK_SPACE: strcpy(key_name, "Key.space"); break;
-                case VK_BACK: strcpy(key_name, "Key.backspace"); break;
-                case VK_TAB: strcpy(key_name, "Key.tab"); break;
-                case VK_ESCAPE: strcpy(key_name, "Key.esc"); break;
-                case VK_SHIFT: case VK_LSHIFT: strcpy(key_name, "Key.shift"); break;
-                case VK_RSHIFT: strcpy(key_name, "Key.shift_r"); break;
-                case VK_CONTROL: case VK_LCONTROL: strcpy(key_name, "Key.ctrl"); break;
-                case VK_RCONTROL: strcpy(key_name, "Key.ctrl_r"); break;
-                case VK_MENU: case VK_LMENU: strcpy(key_name, "Key.alt"); break;
-                case VK_RMENU: strcpy(key_name, "Key.alt_r"); break;
-                case VK_LWIN: strcpy(key_name, "Key.cmd"); break;
-                case VK_RWIN: strcpy(key_name, "Key.cmd_r"); break;
-                case VK_CAPITAL: strcpy(key_name, "Key.caps_lock"); break;
-                case VK_UP: strcpy(key_name, "Key.up"); break;
-                case VK_DOWN: strcpy(key_name, "Key.down"); break;
-                case VK_LEFT: strcpy(key_name, "Key.left"); break;
-                case VK_RIGHT: strcpy(key_name, "Key.right"); break;
-                case VK_HOME: strcpy(key_name, "Key.home"); break;
-                case VK_END: strcpy(key_name, "Key.end"); break;
-                case VK_PRIOR: strcpy(key_name, "Key.page_up"); break;
-                case VK_NEXT: strcpy(key_name, "Key.page_down"); break;
-                case VK_INSERT: strcpy(key_name, "Key.insert"); break;
-                case VK_DELETE: strcpy(key_name, "Key.delete"); break;
-                case VK_F1: strcpy(key_name, "Key.f1"); break;
-                case VK_F2: strcpy(key_name, "Key.f2"); break;
-                case VK_F3: strcpy(key_name, "Key.f3"); break;
-                case VK_F4: strcpy(key_name, "Key.f4"); break;
-                case VK_F5: strcpy(key_name, "Key.f5"); break;
-                case VK_F6: strcpy(key_name, "Key.f6"); break;
-                case VK_F7: strcpy(key_name, "Key.f7"); break;
-                case VK_F8: strcpy(key_name, "Key.f8"); break;
-                case VK_F9: strcpy(key_name, "Key.f9"); break;
-                case VK_F10: strcpy(key_name, "Key.f10"); break;
-                case VK_F11: strcpy(key_name, "Key.f11"); break;
-                case VK_F12: strcpy(key_name, "Key.f12"); break;
-                default: snprintf(key_name, sizeof(key_name), "Key.vk%d", kb->vkCode); break;
+            char printable = 0;
+            if (vk_to_printable_char(kb->vkCode, &printable)) {
+                key_name[0] = printable;
+                key_name[1] = '\0';
+                is_special = false;
+            } else {
+                /* Map special keys */
+                is_special = true;
+                switch (kb->vkCode) {
+                    case VK_RETURN: strcpy(key_name, "Key.enter"); break;
+                    case VK_SPACE: strcpy(key_name, "Key.space"); break;
+                    case VK_BACK: strcpy(key_name, "Key.backspace"); break;
+                    case VK_TAB: strcpy(key_name, "Key.tab"); break;
+                    case VK_ESCAPE: strcpy(key_name, "Key.esc"); break;
+                    case VK_SHIFT: case VK_LSHIFT: strcpy(key_name, "Key.shift"); break;
+                    case VK_RSHIFT: strcpy(key_name, "Key.shift_r"); break;
+                    case VK_CONTROL: case VK_LCONTROL: strcpy(key_name, "Key.ctrl"); break;
+                    case VK_RCONTROL: strcpy(key_name, "Key.ctrl_r"); break;
+                    case VK_MENU: case VK_LMENU: strcpy(key_name, "Key.alt"); break;
+                    case VK_RMENU: strcpy(key_name, "Key.alt_r"); break;
+                    case VK_LWIN: strcpy(key_name, "Key.cmd"); break;
+                    case VK_RWIN: strcpy(key_name, "Key.cmd_r"); break;
+                    case VK_CAPITAL: strcpy(key_name, "Key.caps_lock"); break;
+                    case VK_UP: strcpy(key_name, "Key.up"); break;
+                    case VK_DOWN: strcpy(key_name, "Key.down"); break;
+                    case VK_LEFT: strcpy(key_name, "Key.left"); break;
+                    case VK_RIGHT: strcpy(key_name, "Key.right"); break;
+                    case VK_HOME: strcpy(key_name, "Key.home"); break;
+                    case VK_END: strcpy(key_name, "Key.end"); break;
+                    case VK_PRIOR: strcpy(key_name, "Key.page_up"); break;
+                    case VK_NEXT: strcpy(key_name, "Key.page_down"); break;
+                    case VK_INSERT: strcpy(key_name, "Key.insert"); break;
+                    case VK_DELETE: strcpy(key_name, "Key.delete"); break;
+                    case VK_F1: strcpy(key_name, "Key.f1"); break;
+                    case VK_F2: strcpy(key_name, "Key.f2"); break;
+                    case VK_F3: strcpy(key_name, "Key.f3"); break;
+                    case VK_F4: strcpy(key_name, "Key.f4"); break;
+                    case VK_F5: strcpy(key_name, "Key.f5"); break;
+                    case VK_F6: strcpy(key_name, "Key.f6"); break;
+                    case VK_F7: strcpy(key_name, "Key.f7"); break;
+                    case VK_F8: strcpy(key_name, "Key.f8"); break;
+                    case VK_F9: strcpy(key_name, "Key.f9"); break;
+                    case VK_F10: strcpy(key_name, "Key.f10"); break;
+                    case VK_F11: strcpy(key_name, "Key.f11"); break;
+                    case VK_F12: strcpy(key_name, "Key.f12"); break;
+                    default: snprintf(key_name, sizeof(key_name), "Key.vk%d", kb->vkCode); break;
+                }
             }
         }
         
         char json[128];
         snprintf(json, sizeof(json), "{\"action\":\"%s\",\"key\":\"%s\",\"is_special\":%s}",
                  press ? "press" : "release", key_name, is_special ? "true" : "false");
+        if (press) {
+            context_handle_key_event(&g_client, key_name, is_special, true);
+        } else {
+            context_handle_key_modifier_release(&g_client, key_name);
+        }
         send_input_event(&g_client, "keyboard", json);
 
         if (block_local) {
@@ -2854,6 +3629,7 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
             }
             
             if (should_send) {
+                context_handle_mouse_move(&g_client, pt.x, pt.y);
                 if (!block_local) {
                     send_mouse_move_fast(&g_client, pt.x, pt.y, now);
                     hook_send_count++;
@@ -2916,6 +3692,8 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
             int click_y = block_local ? (int)g_server.cursor_y : pt.y;
             snprintf(json, sizeof(json), "{\"action\":\"%s\",\"button\":\"Button.left\",\"x\":%d,\"y\":%d}",
                      wParam == WM_LBUTTONDOWN ? "press" : "release", click_x, click_y);
+            context_handle_mouse_click(&g_client, click_x, click_y, "Button.left",
+                                       wParam == WM_LBUTTONDOWN ? "press" : "release");
             send_input_event(&g_client, "mouse_click", json);
             break;
         }
@@ -2926,6 +3704,8 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
             int click_y = block_local ? (int)g_server.cursor_y : pt.y;
             snprintf(json, sizeof(json), "{\"action\":\"%s\",\"button\":\"Button.right\",\"x\":%d,\"y\":%d}",
                      wParam == WM_RBUTTONDOWN ? "press" : "release", click_x, click_y);
+            context_handle_mouse_click(&g_client, click_x, click_y, "Button.right",
+                                       wParam == WM_RBUTTONDOWN ? "press" : "release");
             send_input_event(&g_client, "mouse_click", json);
             break;
         }
@@ -2936,6 +3716,8 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
             int click_y = block_local ? (int)g_server.cursor_y : pt.y;
             snprintf(json, sizeof(json), "{\"action\":\"%s\",\"button\":\"Button.middle\",\"x\":%d,\"y\":%d}",
                      wParam == WM_MBUTTONDOWN ? "press" : "release", click_x, click_y);
+            context_handle_mouse_click(&g_client, click_x, click_y, "Button.middle",
+                                       wParam == WM_MBUTTONDOWN ? "press" : "release");
             send_input_event(&g_client, "mouse_click", json);
             break;
         }
@@ -2944,6 +3726,7 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
             int dy = delta > 0 ? 1 : -1;
             char json[128];
             snprintf(json, sizeof(json), "{\"dx\":0,\"dy\":%d}", dy);
+            context_handle_mouse_scroll(&g_client, pt.x, pt.y, 0, dy);
             send_input_event(&g_client, "mouse_scroll", json);
             break;
         }
@@ -2952,6 +3735,7 @@ static LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lPara
             int dx = delta > 0 ? 1 : -1;
             char json[128];
             snprintf(json, sizeof(json), "{\"dx\":%d,\"dy\":0}", dx);
+            context_handle_mouse_scroll(&g_client, pt.x, pt.y, dx, 0);
             send_input_event(&g_client, "mouse_scroll", json);
             break;
         }
@@ -4845,6 +5629,8 @@ static void* input_capture_thread(void *arg) {
                                 "{\"x\":%.0f,\"y\":%.0f,\"button\":\"%s\",\"action\":\"%s\"}",
                                 last_x, last_y, btn_name,
                                 ev.value == 1 ? "press" : "release");
+                            context_handle_mouse_click(client, (int)last_x, (int)last_y,
+                                                       btn_name, ev.value == 1 ? "press" : "release");
                             send_input_event(client, "mouse_click", json);
                         }
                     } else if (key_name) {
@@ -4856,6 +5642,11 @@ static void* input_capture_thread(void *arg) {
                                 ev.value == 1 ? "press" : "release",
                                 key_name,
                                 is_special ? "true" : "false");
+                            if (ev.value == 1) {
+                                context_handle_key_event(client, key_name, is_special, true);
+                            } else {
+                                context_handle_key_modifier_release(client, key_name);
+                            }
                             send_input_event(client, "keyboard", json);
                             
                             /* Check for ESC to exit */
@@ -4882,6 +5673,7 @@ static void* input_capture_thread(void *arg) {
                         snprintf(json, sizeof(json),
                             "{\"x\":%.0f,\"y\":%.0f,\"dx\":0,\"dy\":%d}",
                             last_x, last_y, ev.value);
+                        context_handle_mouse_scroll(client, (int)last_x, (int)last_y, 0, ev.value);
                         send_input_event(client, "mouse_scroll", json);
                     }
                     
@@ -4896,6 +5688,7 @@ static void* input_capture_thread(void *arg) {
                                 char json[128];
                                 snprintf(json, sizeof(json),
                                     "{\"x\":%.0f,\"y\":%.0f}", last_x, last_y);
+                                context_handle_mouse_move(client, (int)last_x, (int)last_y);
                                 send_input_event(client, "mouse_move", json);
                             }
                             last_move_time = now;
@@ -5059,6 +5852,7 @@ static void* x11_input_capture_thread(void *arg) {
                     } else {
                         char json[128];
                         snprintf(json, sizeof(json), "{\"x\":%d,\"y\":%d}", root_x, root_y);
+                        context_handle_mouse_move(client, root_x, root_y);
                         send_input_event(client, "mouse_move", json);
                         move_count++;
                         
@@ -5119,6 +5913,8 @@ static void* x11_input_capture_thread(void *arg) {
                         snprintf(json, sizeof(json),
                             "{\"x\":%d,\"y\":%d,\"button\":\"Button.left\",\"action\":\"%s\"}",
                             root_x, root_y, pressed ? "press" : "release");
+                        context_handle_mouse_click(client, root_x, root_y, "Button.left",
+                                                   pressed ? "press" : "release");
                         send_input_event(client, "mouse_click", json);
                         LOG_INFO("🖱️ CLICK: left %s at (%d,%d), queue=%d", 
                                  pressed ? "press" : "release", root_x, root_y,
@@ -5131,6 +5927,8 @@ static void* x11_input_capture_thread(void *arg) {
                         snprintf(json, sizeof(json),
                             "{\"x\":%d,\"y\":%d,\"button\":\"Button.middle\",\"action\":\"%s\"}",
                             root_x, root_y, pressed ? "press" : "release");
+                        context_handle_mouse_click(client, root_x, root_y, "Button.middle",
+                                                   pressed ? "press" : "release");
                         send_input_event(client, "mouse_click", json);
                         LOG_INFO("🖱️ CLICK: middle %s at (%d,%d)", pressed ? "press" : "release", root_x, root_y);
                     }
@@ -5141,6 +5939,8 @@ static void* x11_input_capture_thread(void *arg) {
                         snprintf(json, sizeof(json),
                             "{\"x\":%d,\"y\":%d,\"button\":\"Button.right\",\"action\":\"%s\"}",
                             root_x, root_y, pressed ? "press" : "release");
+                        context_handle_mouse_click(client, root_x, root_y, "Button.right",
+                                                   pressed ? "press" : "release");
                         send_input_event(client, "mouse_click", json);
                         LOG_INFO("🖱️ CLICK: right %s at (%d,%d)", pressed ? "press" : "release", root_x, root_y);
                     }
@@ -5151,6 +5951,7 @@ static void* x11_input_capture_thread(void *arg) {
                         char json[128];
                         snprintf(json, sizeof(json),
                             "{\"x\":%d,\"y\":%d,\"dx\":0,\"dy\":1}", root_x, root_y);
+                        context_handle_mouse_scroll(client, root_x, root_y, 0, 1);
                         send_input_event(client, "mouse_scroll", json);
                         LOG_INFO("🖱️ SCROLL: up at (%d,%d)", root_x, root_y);
                     }
@@ -5158,6 +5959,7 @@ static void* x11_input_capture_thread(void *arg) {
                         char json[128];
                         snprintf(json, sizeof(json),
                             "{\"x\":%d,\"y\":%d,\"dx\":0,\"dy\":-1}", root_x, root_y);
+                        context_handle_mouse_scroll(client, root_x, root_y, 0, -1);
                         send_input_event(client, "mouse_scroll", json);
                         LOG_INFO("🖱️ SCROLL: down at (%d,%d)", root_x, root_y);
                     }
@@ -5208,6 +6010,11 @@ static void* x11_input_capture_thread(void *arg) {
                         is_press ? "press" : "release",
                         formatted_key,
                         is_special ? "true" : "false");
+                    if (is_press) {
+                        context_handle_key_event(client, formatted_key, is_special, true);
+                    } else {
+                        context_handle_key_modifier_release(client, formatted_key);
+                    }
                     send_input_event(client, "keyboard", json);
                     
                     static int key_count = 0;
@@ -5298,6 +6105,9 @@ static int client_init(ClientState *client) {
     client->config.port = 8765;
     client->config.use_ssl = false;
     strcpy(client->config.role, "player");
+    client->config.context_path[0] = '\0';
+    strcpy(client->config.context_format, "json");
+    strcpy(client->config.context_template, "YYYY_MM_DD_HH_MM_SS-[ds_name]-context.json");
 
 #ifdef PLATFORM_WINDOWS
     client->keyboard_hook = NULL;
@@ -5396,7 +6206,9 @@ static void client_cleanup(ClientState *client) {
     /* Show cursor */
     while (ShowCursor(TRUE) < 0);
 #endif
-    
+    /* Flush and close context log */
+    context_logger_shutdown(client);
+
     /* Cleanup message queue */
     msg_queue_destroy(&client->msg_queue);
     
@@ -5643,6 +6455,9 @@ static void print_usage(const char *prog) {
     printf("  --port PORT        Server port (default: 8765)\n");
     printf("  --ssl              Use SSL/TLS (wss://)\n");
     printf("  --logs-path PATH   Log folder path (overrides LOGS_FOLDER_PATH)\n");
+    printf("  --context-path PATH            Context folder path (overrides CONTEXT_FOLDER_PATH)\n");
+    printf("  --context-format FORMAT        Context format (default: json)\n");
+    printf("  --context-file-naming TEMPLATE Context filename template\n");
     printf("  --debug            Enable debug logging\n");
     printf("  --help             Show this help\n");
     printf("\nModes:\n");
@@ -5734,8 +6549,23 @@ int main(int argc, char *argv[]) {
             set_env_override("LOGS_FOLDER_PATH", argv[++i]);
         } else if (strcmp(argv[i], "--debug") == 0) {
             g_client.config.log_level = LOG_DEBUG;
+        } else if (strcmp(argv[i], "--context-path") == 0 && i + 1 < argc) {
+            strncpy(g_client.config.context_path, argv[++i],
+                    sizeof(g_client.config.context_path) - 1);
+            g_client.config.context_path[sizeof(g_client.config.context_path) - 1] = '\0';
+        } else if (strcmp(argv[i], "--context-format") == 0 && i + 1 < argc) {
+            strncpy(g_client.config.context_format, argv[++i],
+                    sizeof(g_client.config.context_format) - 1);
+            g_client.config.context_format[sizeof(g_client.config.context_format) - 1] = '\0';
+        } else if (strcmp(argv[i], "--context-file-naming") == 0 && i + 1 < argc) {
+            strncpy(g_client.config.context_template, argv[++i],
+                    sizeof(g_client.config.context_template) - 1);
+            g_client.config.context_template[sizeof(g_client.config.context_template) - 1] = '\0';
         }
     }
+
+    /* Initialize context logging after config is parsed */
+    context_logger_init(&g_client);
 
     /* Handle --role main without --server: Run embedded server mode */
     if (strcmp(g_client.config.role, "main") == 0 && g_client.config.server_url[0] == '\0') {
@@ -5770,6 +6600,7 @@ int main(int argc, char *argv[]) {
         /* Start embedded WebSocket server */
         if (start_embedded_server(port) != 0) {
             LOG_ERROR("Failed to start embedded server");
+            client_cleanup(&g_client);
             cleanup_logging();
             return 1;
         }
@@ -5835,6 +6666,9 @@ int main(int argc, char *argv[]) {
                 LOG_ERROR("WebSocket service error");
                 break;
             }
+
+            /* Flush aggregated context events */
+            context_tick(&g_client);
 
             /* Process server commands queued by hooks (e.g., edge crossings) */
             char cmd_msg[MSG_MAX_LEN];
@@ -6064,6 +6898,9 @@ int main(int argc, char *argv[]) {
                 g_shutdown = 1;
                 break;
             }
+
+            /* Flush aggregated context events */
+            context_tick(&g_client);
             
             /* Periodic heartbeat log (every 60 seconds) */
             static double last_heartbeat = 0;
