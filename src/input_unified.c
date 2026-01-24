@@ -456,6 +456,16 @@ static void load_env_file(void) {
     fclose(env_file);
 }
 
+static void set_env_override(const char *key, const char *value) {
+#ifdef PLATFORM_WINDOWS
+    char env_str[1024];
+    snprintf(env_str, sizeof(env_str), "%s=%s", key, value);
+    _putenv(env_str);
+#else
+    setenv(key, value, 1);
+#endif
+}
+
 static int init_logging(const char *computer_name, const char *role) {
 
     /* Get timestamp in format YYYY_MM_DD_HH_MM_SS */
@@ -5632,6 +5642,7 @@ static void print_usage(const char *prog) {
     printf("  --role ROLE        Role: 'main' or 'player' (default: player)\n");
     printf("  --port PORT        Server port (default: 8765)\n");
     printf("  --ssl              Use SSL/TLS (wss://)\n");
+    printf("  --logs-path PATH   Log folder path (overrides LOGS_FOLDER_PATH)\n");
     printf("  --debug            Enable debug logging\n");
     printf("  --help             Show this help\n");
     printf("\nModes:\n");
@@ -5668,7 +5679,7 @@ int main(int argc, char *argv[]) {
 #endif
     }
     
-    /* Parse computer-id and role from command line early (for logging) */
+    /* Parse computer-id, role, and logs-path from command line early (for logging) */
     char role[16] = "player";  /* Default role */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--computer-id") == 0 && i + 1 < argc) {
@@ -5677,6 +5688,8 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--role") == 0 && i + 1 < argc) {
             strncpy(role, argv[i + 1], sizeof(role) - 1);
             role[sizeof(role) - 1] = '\0';
+        } else if (strcmp(argv[i], "--logs-path") == 0 && i + 1 < argc) {
+            set_env_override("LOGS_FOLDER_PATH", argv[i + 1]);
         }
     }
 
@@ -5717,6 +5730,8 @@ int main(int argc, char *argv[]) {
             g_client.config.port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--ssl") == 0) {
             g_client.config.use_ssl = true;
+        } else if (strcmp(argv[i], "--logs-path") == 0 && i + 1 < argc) {
+            set_env_override("LOGS_FOLDER_PATH", argv[++i]);
         } else if (strcmp(argv[i], "--debug") == 0) {
             g_client.config.log_level = LOG_DEBUG;
         }
