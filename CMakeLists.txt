@@ -36,6 +36,11 @@ set_target_properties(input_unified PROPERTIES
 )
 
 # OpenSSL
+# Allow OPENSSL_ROOT_DIR to be set via environment variable or CMake variable
+if(DEFINED ENV{OPENSSL_ROOT_DIR} AND NOT DEFINED OPENSSL_ROOT_DIR)
+    set(OPENSSL_ROOT_DIR $ENV{OPENSSL_ROOT_DIR})
+endif()
+
 find_package(OpenSSL REQUIRED)
 target_link_libraries(input_unified PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 
