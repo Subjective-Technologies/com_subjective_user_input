@@ -124,9 +124,21 @@ if ($Compiler -eq "msvc") {
 
     cmake @cmakeArgs
     cmake --build build/windows-msvc --config Release
+
+    $outputDir = Join-Path $RootDir "build\windows"
+    $dllSourceDir = Join-Path $RootDir "lib\windows"
+    if ((Test-Path $outputDir) -and (Test-Path $dllSourceDir)) {
+        Copy-Item -Path (Join-Path $dllSourceDir "*.dll") -Destination $outputDir -Force -ErrorAction SilentlyContinue
+    }
     exit $LASTEXITCODE
 }
 
 cmake -S . -B build/windows -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build build/windows
+
+$outputDir = Join-Path $RootDir "build\windows"
+$dllSourceDir = Join-Path $RootDir "lib\windows"
+if ((Test-Path $outputDir) -and (Test-Path $dllSourceDir)) {
+    Copy-Item -Path (Join-Path $dllSourceDir "*.dll") -Destination $outputDir -Force -ErrorAction SilentlyContinue
+}
 
