@@ -5405,6 +5405,12 @@ static void handle_input_event(ClientState *client, JsonValue *msg) {
         const char *action = json_get_string(data, "action", "");
         const char *key = json_get_string(data, "key", "");
         bool is_special = json_get_bool(data, "is_special", false);
+
+        if (strcmp(action, "press") == 0) {
+            context_handle_key_event(client, key, is_special, true);
+        } else if (strcmp(action, "release") == 0) {
+            context_handle_key_modifier_release(client, key);
+        }
         
         LOG_INFO("⌨️  Executing key: %s %s", action, key);
         inject_key_linux(display, key, is_special, strcmp(action, "press") == 0);
@@ -5444,6 +5450,11 @@ static void handle_input_event(ClientState *client, JsonValue *msg) {
         const char *action = json_get_string(data, "action", "");
         const char *key = json_get_string(data, "key", "");
         bool is_special = json_get_bool(data, "is_special", false);
+        if (strcmp(action, "press") == 0) {
+            context_handle_key_event(client, key, is_special, true);
+        } else if (strcmp(action, "release") == 0) {
+            context_handle_key_modifier_release(client, key);
+        }
         inject_key_windows(key, is_special, strcmp(action, "press") == 0);
     } else if (strcmp(event_type, "mouse_move") == 0) {
         inject_mouse_move_windows((int)json_get_number(data, "x", 0),
@@ -5463,6 +5474,11 @@ static void handle_input_event(ClientState *client, JsonValue *msg) {
         const char *action = json_get_string(data, "action", "");
         const char *key = json_get_string(data, "key", "");
         bool is_special = json_get_bool(data, "is_special", false);
+        if (strcmp(action, "press") == 0) {
+            context_handle_key_event(client, key, is_special, true);
+        } else if (strcmp(action, "release") == 0) {
+            context_handle_key_modifier_release(client, key);
+        }
         inject_key_macos(key, is_special, strcmp(action, "press") == 0);
     } else if (strcmp(event_type, "mouse_move") == 0) {
         inject_mouse_move_macos((int)json_get_number(data, "x", 0),
