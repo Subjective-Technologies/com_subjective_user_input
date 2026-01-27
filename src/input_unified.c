@@ -148,6 +148,13 @@
 #define CONTEXT_MOUSE_WINDOW_MS 250
 #define CONTEXT_TEXT_BUF_CAP 512
 
+/* Human energy model defaults */
+#define ENERGY_DEFAULT_DPI 96.0
+#define ENERGY_HUMAN_J_PER_METER 0.8
+#define ENERGY_HUMAN_J_PER_CLICK 0.01
+#define ENERGY_HUMAN_J_PER_KEYPRESS 0.005
+#define ENERGY_HUMAN_HOLD_POWER_W 1.0
+
 /* Log levels */
 typedef enum {
     LOG_DEBUG = 0,
@@ -202,6 +209,14 @@ typedef struct {
     char button[32];
 } InputEventData;
 
+typedef struct {
+    double dpi;
+    double j_per_meter;
+    double j_per_click;
+    double j_per_keypress;
+    double hold_power_w;
+} EnergyModelConfig;
+
 /* Context logging for Subjective */
 typedef struct {
     FILE *file;
@@ -211,6 +226,9 @@ typedef struct {
     char dir_path[512];
     char format[16];
     char filename_template[256];
+    char total_energy_path[1024];
+    double total_energy_joules;
+    EnergyModelConfig energy_model;
 
     /* Text aggregation */
     char text_buf[512];
@@ -1382,6 +1400,165 @@ static void context_strlcat(char *dst, size_t dst_size, const char *src) {
     dst[len + src_len] = '\0';
 }
 
+static double energy_sanitize_value(double value) {
+    if (!isfinite(value) || value < 0.0) return 0.0;
+    return value;
+}
+
+static void energy_model_set_defaults(EnergyModelConfig *model) {
+    if (!model) return;
+    model->dpi = ENERGY_DEFAULT_DPI;
+    model->j_per_meter = ENERGY_HUMAN_J_PER_METER;
+    model->j_per_click = ENERGY_HUMAN_J_PER_CLICK;
+    model->j_per_keypress = ENERGY_HUMAN_J_PER_KEYPRESS;
+    model->hold_power_w = ENERGY_HUMAN_HOLD_POWER_W;
+}
+
+static double energy_env_double(const char *name, double def, double min_value) {
+    const char *val = getenv(name);
+    if (!val || !val[0]) return def;
+    char *end = NULL;
+    double parsed = strtod(val, &end);
+    if (end == val || !isfinite(parsed) || parsed < min_value) return def;
+    while (end && (*end == ' ' || *end == '\t')) end++;
+    if (end && *end != '\0') return def;
+    return parsed;
+}
+
+static void energy_model_apply_env(EnergyModelConfig *model) {
+    if (!model) return;
+    model->dpi = energy_env_double("HUMAN_INPUT_DPI", model->dpi, 1.0);
+    model->j_per_meter = energy_env_double("HUMAN_J_PER_METER", model->j_per_meter, 0.0);
+    model->j_per_click = energy_env_double("HUMAN_J_PER_CLICK", model->j_per_click, 0.0);
+    model->j_per_keypress = energy_env_double("HUMAN_J_PER_KEYPRESS", model->j_per_keypress, 0.0);
+    model->hold_power_w = energy_env_double("HUMAN_HOLD_POWER_W", model->hold_power_w, 0.0);
+}
+
+static void energy_model_init(EnergyModelConfig *model) {
+    energy_model_set_defaults(model);
+    energy_model_apply_env(model);
+}
+
+static double energy_mouse_move_joules(const EnergyModelConfig *model, double distance_pixels) {
+    if (!model) return 0.0;
+    if (!isfinite(model->dpi) || model->dpi <= 0.0) return 0.0;
+    double meters = distance_pixels * (0.0254 / model->dpi);
+    double energy = meters * model->j_per_meter;
+    return energy_sanitize_value(energy);
+}
+
+static double energy_mouse_click_joules(const EnergyModelConfig *model, const char *action) {
+    if (!model || !action) return 0.0;
+    if (strcmp(action, "press") != 0) return 0.0;
+    return energy_sanitize_value(model->j_per_click);
+}
+
+static double energy_keypress_joules(const EnergyModelConfig *model, size_t key_count) {
+    if (!model) return 0.0;
+    double energy = (double)key_count * model->j_per_keypress;
+    return energy_sanitize_value(energy);
+}
+
+static void energy_format_fixed8(char *out, size_t out_size, double value) {
+    if (!out || out_size == 0) return;
+    double clean = energy_sanitize_value(value);
+    snprintf(out, out_size, "%.8f", clean);
+}
+
+static void sb_append_energy_exerted(StringBuilder *sb, double energy) {
+    if (!sb) return;
+    char numbuf[64];
+    energy_format_fixed8(numbuf, sizeof(numbuf), energy);
+    sb_append(sb, ",\"energy_exerted\":");
+    sb_append(sb, numbuf);
+}
+
+static bool energy_write_total_file(const char *path, double total_energy) {
+    if (!path || !path[0]) return false;
+    char tmp_path[1100];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+
+    FILE *fp = fopen(tmp_path, "wb");
+    if (!fp) return false;
+
+    char numbuf[64];
+    energy_format_fixed8(numbuf, sizeof(numbuf), total_energy);
+    fprintf(fp, "{\n  \"total_energy_exerted_joules\": %s\n}\n", numbuf);
+    fflush(fp);
+    if (fclose(fp) != 0) {
+        remove(tmp_path);
+        return false;
+    }
+
+#ifdef PLATFORM_WINDOWS
+    if (!MoveFileExA(tmp_path, path, MOVEFILE_REPLACE_EXISTING)) {
+        remove(tmp_path);
+        return false;
+    }
+#else
+    if (rename(tmp_path, path) != 0) {
+        remove(tmp_path);
+        return false;
+    }
+#endif
+    return true;
+}
+
+static double energy_load_total_file(const char *path) {
+    if (!path || !path[0]) return 0.0;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return 0.0;
+
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return 0.0;
+    }
+    long size = ftell(fp);
+    if (size <= 0 || size > (1024 * 1024)) {
+        fclose(fp);
+        return 0.0;
+    }
+    if (fseek(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
+        return 0.0;
+    }
+
+    char *buf = (char *)malloc((size_t)size + 1);
+    if (!buf) {
+        fclose(fp);
+        return 0.0;
+    }
+    size_t read_len = fread(buf, 1, (size_t)size, fp);
+    buf[read_len] = '\0';
+    fclose(fp);
+
+    JsonValue *root = json_parse(buf);
+    free(buf);
+
+    double total = 0.0;
+    if (root && root->type == JSON_OBJECT) {
+        total = json_get_number(root, "total_energy_exerted_joules", 0.0);
+    }
+    json_free(root);
+    return energy_sanitize_value(total);
+}
+
+static void context_update_total_energy(ContextLogger *ctx, double energy) {
+    if (!ctx || ctx->total_energy_path[0] == '\0') return;
+    double clean = energy_sanitize_value(energy);
+    if (!isfinite(ctx->total_energy_joules) || ctx->total_energy_joules < 0.0) {
+        ctx->total_energy_joules = 0.0;
+    }
+    double next_total = ctx->total_energy_joules + clean;
+    if (!isfinite(next_total) || next_total < ctx->total_energy_joules) {
+        next_total = ctx->total_energy_joules;
+    }
+    ctx->total_energy_joules = next_total;
+    if (!energy_write_total_file(ctx->total_energy_path, ctx->total_energy_joules)) {
+        LOG_WARN("Failed to update total energy file: %s", ctx->total_energy_path);
+    }
+}
+
 static void context_replace_token(char *out, size_t out_size, const char *src,
                                   const char *token, const char *replacement) {
     if (!out || out_size == 0 || !src || !token || !replacement) return;
@@ -1478,6 +1655,8 @@ static void context_flush_text(ClientState *client) {
     char numbuf[64];
     snprintf(numbuf, sizeof(numbuf), "\"char_count\":%zu", ctx->text_len);
     sb_append(&sb, numbuf);
+    double energy = energy_keypress_joules(&ctx->energy_model, ctx->text_len);
+    sb_append_energy_exerted(&sb, energy);
     sb_append(&sb, ",\"computer_id\":");
     sb_append_escaped(&sb, client->config.computer_id);
     sb_append(&sb, ",\"monitor_id\":");
@@ -1485,6 +1664,7 @@ static void context_flush_text(ClientState *client) {
     sb_append(&sb, "}");
 
     context_append_event(ctx, sb.buf);
+    context_update_total_energy(ctx, energy);
     free(sb.buf);
     context_reset_text(ctx);
 }
@@ -1518,6 +1698,8 @@ static void context_flush_mouse(ClientState *client) {
              ctx->mouse_last_x, ctx->mouse_last_y,
              ctx->mouse_total_distance, ctx->mouse_sample_count);
     sb_append(&sb, buf);
+    double energy = energy_mouse_move_joules(&ctx->energy_model, ctx->mouse_total_distance);
+    sb_append_energy_exerted(&sb, energy);
     sb_append(&sb, ",\"computer_id\":");
     sb_append_escaped(&sb, client->config.computer_id);
     sb_append(&sb, ",\"monitor_id\":");
@@ -1525,6 +1707,7 @@ static void context_flush_mouse(ClientState *client) {
     sb_append(&sb, "}");
 
     context_append_event(ctx, sb.buf);
+    context_update_total_energy(ctx, energy);
     free(sb.buf);
     context_reset_mouse(ctx);
 }
@@ -1723,6 +1906,8 @@ static void context_handle_mouse_click(ClientState *client, int x, int y,
              "\"x\":%d,\"y\":%d,\"button\":\"%s\",\"action\":\"%s\"",
              x, y, button ? button : "", action ? action : "");
     sb_append(&sb, buf);
+    double energy = energy_mouse_click_joules(&ctx->energy_model, action);
+    sb_append_energy_exerted(&sb, energy);
     sb_append(&sb, ",\"computer_id\":");
     sb_append_escaped(&sb, client->config.computer_id);
     sb_append(&sb, ",\"monitor_id\":");
@@ -1730,6 +1915,7 @@ static void context_handle_mouse_click(ClientState *client, int x, int y,
     sb_append(&sb, "}");
 
     context_append_event(ctx, sb.buf);
+    context_update_total_energy(ctx, energy);
     free(sb.buf);
     context_unlock(ctx);
 }
@@ -1760,6 +1946,8 @@ static void context_handle_mouse_scroll(ClientState *client, int x, int y, int d
              "\"x\":%d,\"y\":%d,\"dx\":%d,\"dy\":%d",
              x, y, dx, dy);
     sb_append(&sb, buf);
+    double energy = 0.0;
+    sb_append_energy_exerted(&sb, energy);
     sb_append(&sb, ",\"computer_id\":");
     sb_append_escaped(&sb, client->config.computer_id);
     sb_append(&sb, ",\"monitor_id\":");
@@ -1767,6 +1955,7 @@ static void context_handle_mouse_scroll(ClientState *client, int x, int y, int d
     sb_append(&sb, "}");
 
     context_append_event(ctx, sb.buf);
+    context_update_total_energy(ctx, energy);
     free(sb.buf);
     context_unlock(ctx);
 }
@@ -1811,6 +2000,8 @@ static void context_handle_clipboard_update(ClientState *client, const char *con
         sb_append(&sb, ",\"content\":");
         sb_append_escaped(&sb, content);
     }
+    double energy = 0.0;
+    sb_append_energy_exerted(&sb, energy);
     sb_append(&sb, ",\"computer_id\":");
     sb_append_escaped(&sb, client->config.computer_id);
     sb_append(&sb, ",\"monitor_id\":");
@@ -1818,6 +2009,7 @@ static void context_handle_clipboard_update(ClientState *client, const char *con
     sb_append(&sb, "}");
 
     context_append_event(ctx, sb.buf);
+    context_update_total_energy(ctx, energy);
     free(sb.buf);
 
     context_unlock(ctx);
@@ -1848,6 +2040,7 @@ static void context_tick(ClientState *client) {
 static void context_logger_init(ClientState *client) {
     ContextLogger *ctx = &client->context_logger;
     memset(ctx, 0, sizeof(ContextLogger));
+    energy_model_init(&ctx->energy_model);
 
 #ifdef PLATFORM_LINUX
     pthread_mutex_init(&ctx->mutex, NULL);
@@ -1886,6 +2079,12 @@ static void context_logger_init(ClientState *client) {
 
     strncpy(ctx->dir_path, dir, sizeof(ctx->dir_path) - 1);
     context_ensure_dir(ctx->dir_path);
+
+    ctx->total_energy_path[0] = '\0';
+    context_strlcat(ctx->total_energy_path, sizeof(ctx->total_energy_path), ctx->dir_path);
+    context_strlcat(ctx->total_energy_path, sizeof(ctx->total_energy_path), "/");
+    context_strlcat(ctx->total_energy_path, sizeof(ctx->total_energy_path), "total_energy_exertion.json");
+    ctx->total_energy_joules = energy_load_total_file(ctx->total_energy_path);
 
     const char *tmpl = client->config.context_template[0]
                            ? client->config.context_template
@@ -6557,6 +6756,150 @@ static void signal_handler(int sig) {
     g_server.running = false;
 }
 
+static bool energy_is_fixed8(const char *num_str) {
+    if (!num_str || !num_str[0]) return false;
+    if (strchr(num_str, 'e') || strchr(num_str, 'E')) return false;
+    const char *dot = strchr(num_str, '.');
+    if (!dot) return false;
+    return strlen(dot + 1) == 8;
+}
+
+static bool energy_read_file_snippet(const char *path, char *out, size_t out_size) {
+    if (!path || !out || out_size == 0) return false;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return false;
+    size_t read_len = fread(out, 1, out_size - 1, fp);
+    out[read_len] = '\0';
+    fclose(fp);
+    return read_len > 0;
+}
+
+static bool energy_extract_total_value(const char *json, char *out, size_t out_size) {
+    if (!json || !out || out_size == 0) return false;
+    const char *key = "\"total_energy_exerted_joules\"";
+    const char *pos = strstr(json, key);
+    if (!pos) return false;
+    pos = strchr(pos, ':');
+    if (!pos) return false;
+    pos++;
+    while (*pos == ' ' || *pos == '\t') pos++;
+    size_t i = 0;
+    while (*pos && *pos != '\n' && *pos != '\r' && *pos != '}' && i + 1 < out_size) {
+        out[i++] = *pos++;
+    }
+    while (i > 0 && out[i - 1] == ' ') i--;
+    out[i] = '\0';
+    return i > 0;
+}
+
+static bool energy_make_temp_dir(char *out, size_t out_size) {
+    if (!out || out_size == 0) return false;
+#ifdef PLATFORM_WINDOWS
+    char base[MAX_PATH];
+    DWORD len = GetTempPathA(sizeof(base), base);
+    if (len == 0 || len >= sizeof(base)) return false;
+    unsigned long now = (unsigned long)time(NULL);
+    unsigned pid = (unsigned)GetCurrentProcessId();
+    snprintf(out, out_size, "%senergy_test_%lu_%u", base, now, pid);
+    if (_mkdir(out) != 0 && errno != EEXIST) return false;
+#else
+    const char *base = getenv("TMPDIR");
+    if (!base || !base[0]) base = "/tmp";
+    long now = (long)time(NULL);
+    int pid = (int)getpid();
+    snprintf(out, out_size, "%s/energy_test_%ld_%d", base, now, pid);
+    if (mkdir(out, 0755) != 0 && errno != EEXIST) return false;
+#endif
+    return true;
+}
+
+static int energy_run_self_tests(void) {
+    EnergyModelConfig model;
+    energy_model_set_defaults(&model);
+
+    char numbuf[64];
+    double energy = energy_mouse_move_joules(&model, 96.0);
+    energy_format_fixed8(numbuf, sizeof(numbuf), energy);
+    if (strcmp(numbuf, "0.02032000") != 0) {
+        fprintf(stderr, "Mouse move energy failed: %s\n", numbuf);
+        return 1;
+    }
+
+    energy = energy_mouse_click_joules(&model, "press");
+    energy_format_fixed8(numbuf, sizeof(numbuf), energy);
+    if (strcmp(numbuf, "0.01000000") != 0) {
+        fprintf(stderr, "Mouse click energy failed: %s\n", numbuf);
+        return 1;
+    }
+
+    energy = energy_keypress_joules(&model, 2);
+    energy_format_fixed8(numbuf, sizeof(numbuf), energy);
+    if (strcmp(numbuf, "0.01000000") != 0) {
+        fprintf(stderr, "Keypress energy failed: %s\n", numbuf);
+        return 1;
+    }
+
+    energy_format_fixed8(numbuf, sizeof(numbuf), 0.00000001);
+    if (!energy_is_fixed8(numbuf)) {
+        fprintf(stderr, "Fixed-precision formatting failed: %s\n", numbuf);
+        return 1;
+    }
+
+    char temp_dir[512];
+    if (!energy_make_temp_dir(temp_dir, sizeof(temp_dir))) {
+        fprintf(stderr, "Failed to create temp dir for tests\n");
+        return 1;
+    }
+
+    char total_path[1024];
+    snprintf(total_path, sizeof(total_path), "%s/total_energy_exertion.json", temp_dir);
+
+    ContextLogger ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    strncpy(ctx.total_energy_path, total_path, sizeof(ctx.total_energy_path) - 1);
+    ctx.total_energy_path[sizeof(ctx.total_energy_path) - 1] = '\0';
+    ctx.total_energy_joules = 0.0;
+    context_update_total_energy(&ctx, 0.01);
+    context_update_total_energy(&ctx, 0.02);
+
+    double loaded = energy_load_total_file(total_path);
+    if (fabs(loaded - 0.03) > 1e-9) {
+        fprintf(stderr, "Total energy persistence failed: %.12f\n", loaded);
+        remove(total_path);
+#ifdef PLATFORM_WINDOWS
+        _rmdir(temp_dir);
+#else
+        rmdir(temp_dir);
+#endif
+        return 1;
+    }
+
+    char file_buf[256];
+    char extracted[64];
+    if (!energy_read_file_snippet(total_path, file_buf, sizeof(file_buf)) ||
+        !energy_extract_total_value(file_buf, extracted, sizeof(extracted)) ||
+        !energy_is_fixed8(extracted)) {
+        fprintf(stderr, "Total file formatting failed\n");
+        remove(total_path);
+#ifdef PLATFORM_WINDOWS
+        _rmdir(temp_dir);
+#else
+        rmdir(temp_dir);
+#endif
+        return 1;
+    }
+
+    remove(total_path);
+#ifdef PLATFORM_WINDOWS
+    _rmdir(temp_dir);
+#else
+    rmdir(temp_dir);
+#endif
+
+    fprintf(stdout, "Energy self-tests passed.\n");
+    return 0;
+}
+
 static void print_usage(const char *prog) {
     printf("Usage: %s [options]\n", prog);
     printf("\nOptions:\n");
@@ -6569,6 +6912,7 @@ static void print_usage(const char *prog) {
     printf("  --context-path PATH            Context folder path (overrides CONTEXT_FOLDER_PATH)\n");
     printf("  --context-format FORMAT        Context format (default: json)\n");
     printf("  --context-file-naming TEMPLATE Context filename template\n");
+    printf("  --energy-test      Run energy logging self-tests and exit\n");
     printf("  --debug            Enable debug logging\n");
     printf("  --help             Show this help\n");
     printf("\nModes:\n");
@@ -6584,6 +6928,12 @@ static void print_usage(const char *prog) {
 int main(int argc, char *argv[]) {
     /* Load .env file first (before anything else) */
     load_env_file();
+
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--energy-test") == 0) {
+            return energy_run_self_tests();
+        }
+    }
 
     /* Get computer name early (for logging) */
     char computer_name[MAX_HOSTNAME];
