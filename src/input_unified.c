@@ -1459,6 +1459,16 @@ static double energy_keypress_joules(const EnergyModelConfig *model, size_t key_
     return energy_sanitize_value(energy);
 }
 
+static double energy_mouse_scroll_joules(const EnergyModelConfig *model, int dx, int dy) {
+    if (!model) return 0.0;
+    /* Calculate total scroll units (absolute values of dx and dy) */
+    int scroll_units = abs(dx) + abs(dy);
+    if (scroll_units == 0) return 0.0;
+    /* Each scroll unit consumes the same energy as a mouse click */
+    double energy = (double)scroll_units * model->j_per_click;
+    return energy_sanitize_value(energy);
+}
+
 static void energy_format_fixed8(char *out, size_t out_size, double value) {
     if (!out || out_size == 0) return;
     double clean = energy_sanitize_value(value);
@@ -1946,7 +1956,7 @@ static void context_handle_mouse_scroll(ClientState *client, int x, int y, int d
              "\"x\":%d,\"y\":%d,\"dx\":%d,\"dy\":%d",
              x, y, dx, dy);
     sb_append(&sb, buf);
-    double energy = 0.0;
+    double energy = energy_mouse_scroll_joules(&ctx->energy_model, dx, dy);
     sb_append_energy_exerted(&sb, energy);
     sb_append(&sb, ",\"computer_id\":");
     sb_append_escaped(&sb, client->config.computer_id);
@@ -6836,6 +6846,34 @@ static int energy_run_self_tests(void) {
     energy_format_fixed8(numbuf, sizeof(numbuf), energy);
     if (strcmp(numbuf, "0.01000000") != 0) {
         fprintf(stderr, "Keypress energy failed: %s\n", numbuf);
+        return 1;
+    }
+
+    energy = energy_mouse_scroll_joules(&model, 1, 0);
+    energy_format_fixed8(numbuf, sizeof(numbuf), energy);
+    if (strcmp(numbuf, "0.01000000") != 0) {
+        fprintf(stderr, "Mouse scroll energy (1 unit) failed: %s\n", numbuf);
+        return 1;
+    }
+
+    energy = energy_mouse_scroll_joules(&model, 2, 0);
+    energy_format_fixed8(numbuf, sizeof(numbuf), energy);
+    if (strcmp(numbuf, "0.02000000") != 0) {
+        fprintf(stderr, "Mouse scroll energy (2 units) failed: %s\n", numbuf);
+        return 1;
+    }
+
+    energy = energy_mouse_scroll_joules(&model, 1, 1);
+    energy_format_fixed8(numbuf, sizeof(numbuf), energy);
+    if (strcmp(numbuf, "0.02000000") != 0) {
+        fprintf(stderr, "Mouse scroll energy (1+1 units) failed: %s\n", numbuf);
+        return 1;
+    }
+
+    energy = energy_mouse_scroll_joules(&model, 0, 0);
+    energy_format_fixed8(numbuf, sizeof(numbuf), energy);
+    if (strcmp(numbuf, "0.00000000") != 0) {
+        fprintf(stderr, "Mouse scroll energy (0 units) failed: %s\n", numbuf);
         return 1;
     }
 
