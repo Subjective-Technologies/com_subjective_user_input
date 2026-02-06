@@ -1358,10 +1358,49 @@ static bool context_file_exists(const char *path) {
 }
 
 static void context_ensure_dir(const char *path) {
+    if (!path || !path[0]) return;
+    
     struct stat st;
     if (stat(path, &st) == 0) {
-        return;
+        return;  /* Directory already exists */
     }
+    
+    /* Create parent directories recursively */
+    char parent_path[1024];
+    strncpy(parent_path, path, sizeof(parent_path) - 1);
+    parent_path[sizeof(parent_path) - 1] = '\0';
+    
+    /* Find the last path separator */
+#ifdef PLATFORM_WINDOWS
+    char *last_sep = strrchr(parent_path, '\\');
+    if (!last_sep) {
+        last_sep = strrchr(parent_path, '/');
+    }
+    /* Don't create parent if we're at a drive root (e.g., "C:\" or "C:") */
+    if (last_sep && last_sep != parent_path) {
+        /* Check if this is a drive root like "C:\" or "C:" */
+        bool is_drive_root = false;
+        if (last_sep == parent_path + 2 && parent_path[1] == ':') {
+            is_drive_root = true;  /* "C:\" */
+        } else if (strlen(parent_path) == 2 && parent_path[1] == ':') {
+            is_drive_root = true;  /* "C:" */
+        }
+        if (!is_drive_root) {
+            *last_sep = '\0';
+            /* Recursively create parent directory */
+            context_ensure_dir(parent_path);
+        }
+    }
+#else
+    char *last_sep = strrchr(parent_path, '/');
+    if (last_sep && last_sep != parent_path) {
+        *last_sep = '\0';
+        /* Recursively create parent directory */
+        context_ensure_dir(parent_path);
+    }
+#endif
+    
+    /* Create this directory */
 #ifdef PLATFORM_WINDOWS
     _mkdir(path);
 #else
@@ -2092,8 +2131,20 @@ static void context_logger_init(ClientState *client) {
 
     ctx->total_energy_path[0] = '\0';
     context_strlcat(ctx->total_energy_path, sizeof(ctx->total_energy_path), ctx->dir_path);
-    context_strlcat(ctx->total_energy_path, sizeof(ctx->total_energy_path), "/");
+    
+    /* Add path separator if not already present */
+    size_t len = strlen(ctx->total_energy_path);
+#ifdef PLATFORM_WINDOWS
+    if (len > 0 && ctx->total_energy_path[len - 1] != '\\' && ctx->total_energy_path[len - 1] != '/') {
+        context_strlcat(ctx->total_energy_path, sizeof(ctx->total_energy_path), "\\");
+    }
     context_strlcat(ctx->total_energy_path, sizeof(ctx->total_energy_path), "total_energy_exertion.json");
+#else
+    if (len > 0 && ctx->total_energy_path[len - 1] != '/') {
+        context_strlcat(ctx->total_energy_path, sizeof(ctx->total_energy_path), "/");
+    }
+    context_strlcat(ctx->total_energy_path, sizeof(ctx->total_energy_path), "total_energy_exertion.json");
+#endif
     ctx->total_energy_joules = energy_load_total_file(ctx->total_energy_path);
 
     const char *tmpl = client->config.context_template[0]
