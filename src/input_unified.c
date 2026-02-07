@@ -4424,14 +4424,582 @@ static void stop_windows_hook_thread(ClientState *client) {
 #endif
 
 #ifdef PLATFORM_MACOS
+
+#define MACOS_KEYCODE_CACHE_SIZE 256
+#define MACOS_KEYNAME_MAX 32
+
+static char g_macos_keyname_cache[MACOS_KEYCODE_CACHE_SIZE][MACOS_KEYNAME_MAX];
+static bool g_macos_keyname_cache_valid[MACOS_KEYCODE_CACHE_SIZE];
+
+/* Forward declarations */
+static void send_input_event(ClientState *client, const char *event_type,
+                             const char *json_data);
+static void send_edge_crossing_request(ClientState *client, const char *edge,
+                                       float position, int cursor_x, int cursor_y);
+static void send_mouse_move_fast(ClientState *client, int x, int y, double now_ms);
+
+static bool macos_keycode_to_special(CGKeyCode code, const char **out_name) {
+    switch (code) {
+        case kVK_Return: *out_name = "Key.enter"; return true;
+        case kVK_Tab: *out_name = "Key.tab"; return true;
+        case kVK_Space: *out_name = "Key.space"; return true;
+        case kVK_Delete: *out_name = "Key.backspace"; return true;
+        case kVK_ForwardDelete: *out_name = "Key.delete"; return true;
+        case kVK_Escape: *out_name = "Key.esc"; return true;
+        case kVK_Shift: *out_name = "Key.shift"; return true;
+        case kVK_RightShift: *out_name = "Key.shift_r"; return true;
+        case kVK_Control: *out_name = "Key.ctrl"; return true;
+        case kVK_RightControl: *out_name = "Key.ctrl_r"; return true;
+        case kVK_Option: *out_name = "Key.alt"; return true;
+        case kVK_RightOption: *out_name = "Key.alt_r"; return true;
+        case kVK_Command: *out_name = "Key.cmd"; return true;
+        case kVK_RightCommand: *out_name = "Key.cmd_r"; return true;
+        case kVK_CapsLock: *out_name = "Key.caps_lock"; return true;
+        case kVK_Home: *out_name = "Key.home"; return true;
+        case kVK_End: *out_name = "Key.end"; return true;
+        case kVK_PageUp: *out_name = "Key.page_up"; return true;
+        case kVK_PageDown: *out_name = "Key.page_down"; return true;
+        case kVK_Help: *out_name = "Key.insert"; return true;
+        case kVK_LeftArrow: *out_name = "Key.left"; return true;
+        case kVK_RightArrow: *out_name = "Key.right"; return true;
+        case kVK_UpArrow: *out_name = "Key.up"; return true;
+        case kVK_DownArrow: *out_name = "Key.down"; return true;
+        case kVK_F1: *out_name = "Key.f1"; return true;
+        case kVK_F2: *out_name = "Key.f2"; return true;
+        case kVK_F3: *out_name = "Key.f3"; return true;
+        case kVK_F4: *out_name = "Key.f4"; return true;
+        case kVK_F5: *out_name = "Key.f5"; return true;
+        case kVK_F6: *out_name = "Key.f6"; return true;
+        case kVK_F7: *out_name = "Key.f7"; return true;
+        case kVK_F8: *out_name = "Key.f8"; return true;
+        case kVK_F9: *out_name = "Key.f9"; return true;
+        case kVK_F10: *out_name = "Key.f10"; return true;
+        case kVK_F11: *out_name = "Key.f11"; return true;
+        case kVK_F12: *out_name = "Key.f12"; return true;
+        default: return false;
+    }
+}
+
+static bool macos_keycode_to_unshifted_char(CGKeyCode code, char *out_char) {
+    switch (code) {
+        case kVK_ANSI_A: *out_char = 'a'; return true;
+        case kVK_ANSI_B: *out_char = 'b'; return true;
+        case kVK_ANSI_C: *out_char = 'c'; return true;
+        case kVK_ANSI_D: *out_char = 'd'; return true;
+        case kVK_ANSI_E: *out_char = 'e'; return true;
+        case kVK_ANSI_F: *out_char = 'f'; return true;
+        case kVK_ANSI_G: *out_char = 'g'; return true;
+        case kVK_ANSI_H: *out_char = 'h'; return true;
+        case kVK_ANSI_I: *out_char = 'i'; return true;
+        case kVK_ANSI_J: *out_char = 'j'; return true;
+        case kVK_ANSI_K: *out_char = 'k'; return true;
+        case kVK_ANSI_L: *out_char = 'l'; return true;
+        case kVK_ANSI_M: *out_char = 'm'; return true;
+        case kVK_ANSI_N: *out_char = 'n'; return true;
+        case kVK_ANSI_O: *out_char = 'o'; return true;
+        case kVK_ANSI_P: *out_char = 'p'; return true;
+        case kVK_ANSI_Q: *out_char = 'q'; return true;
+        case kVK_ANSI_R: *out_char = 'r'; return true;
+        case kVK_ANSI_S: *out_char = 's'; return true;
+        case kVK_ANSI_T: *out_char = 't'; return true;
+        case kVK_ANSI_U: *out_char = 'u'; return true;
+        case kVK_ANSI_V: *out_char = 'v'; return true;
+        case kVK_ANSI_W: *out_char = 'w'; return true;
+        case kVK_ANSI_X: *out_char = 'x'; return true;
+        case kVK_ANSI_Y: *out_char = 'y'; return true;
+        case kVK_ANSI_Z: *out_char = 'z'; return true;
+        case kVK_ANSI_0: *out_char = '0'; return true;
+        case kVK_ANSI_1: *out_char = '1'; return true;
+        case kVK_ANSI_2: *out_char = '2'; return true;
+        case kVK_ANSI_3: *out_char = '3'; return true;
+        case kVK_ANSI_4: *out_char = '4'; return true;
+        case kVK_ANSI_5: *out_char = '5'; return true;
+        case kVK_ANSI_6: *out_char = '6'; return true;
+        case kVK_ANSI_7: *out_char = '7'; return true;
+        case kVK_ANSI_8: *out_char = '8'; return true;
+        case kVK_ANSI_9: *out_char = '9'; return true;
+        case kVK_ANSI_Minus: *out_char = '-'; return true;
+        case kVK_ANSI_Equal: *out_char = '='; return true;
+        case kVK_ANSI_LeftBracket: *out_char = '['; return true;
+        case kVK_ANSI_RightBracket: *out_char = ']'; return true;
+        case kVK_ANSI_Backslash: *out_char = '\\'; return true;
+        case kVK_ANSI_Semicolon: *out_char = ';'; return true;
+        case kVK_ANSI_Quote: *out_char = '\''; return true;
+        case kVK_ANSI_Comma: *out_char = ','; return true;
+        case kVK_ANSI_Period: *out_char = '.'; return true;
+        case kVK_ANSI_Slash: *out_char = '/'; return true;
+        case kVK_ANSI_Grave: *out_char = '`'; return true;
+        default: return false;
+    }
+}
+
+static void macos_cache_key_name(CGKeyCode code, const char *name) {
+    if (code >= MACOS_KEYCODE_CACHE_SIZE) return;
+    strncpy(g_macos_keyname_cache[code], name, MACOS_KEYNAME_MAX - 1);
+    g_macos_keyname_cache[code][MACOS_KEYNAME_MAX - 1] = '\0';
+    g_macos_keyname_cache_valid[code] = true;
+}
+
+static bool macos_resolve_key_name(CGEventRef event, bool is_press,
+                                   char *out, size_t out_size, bool *is_special) {
+    if (!out || out_size == 0) return false;
+
+    CGKeyCode code = (CGKeyCode)CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+    const char *special = NULL;
+    if (macos_keycode_to_special(code, &special)) {
+        strncpy(out, special, out_size - 1);
+        out[out_size - 1] = '\0';
+        *is_special = true;
+        if (is_press) macos_cache_key_name(code, out);
+        return true;
+    }
+
+    UniChar chars[4];
+    UniCharCount len = 0;
+    CGEventKeyboardGetUnicodeString(event, 4, &len, chars);
+    if (len > 0) {
+        UniChar ch = chars[0];
+        if (ch >= 32 && ch <= 126) {
+            out[0] = (char)ch;
+            out[1] = '\0';
+            *is_special = false;
+            if (is_press) macos_cache_key_name(code, out);
+            return true;
+        }
+    }
+
+    if (!is_press && code < MACOS_KEYCODE_CACHE_SIZE && g_macos_keyname_cache_valid[code]) {
+        strncpy(out, g_macos_keyname_cache[code], out_size - 1);
+        out[out_size - 1] = '\0';
+        *is_special = (strncmp(out, "Key.", 4) == 0);
+        return true;
+    }
+
+    char fallback = 0;
+    if (macos_keycode_to_unshifted_char(code, &fallback)) {
+        out[0] = fallback;
+        out[1] = '\0';
+        *is_special = false;
+        if (is_press) macos_cache_key_name(code, out);
+        return true;
+    }
+
+    return false;
+}
+
+static bool macos_key_name_to_keycode(const char *key, CGKeyCode *out_code) {
+    if (!key || !key[0]) return false;
+
+    if (strcmp(key, "Key.enter") == 0) { *out_code = kVK_Return; return true; }
+    if (strcmp(key, "Key.tab") == 0) { *out_code = kVK_Tab; return true; }
+    if (strcmp(key, "Key.space") == 0) { *out_code = kVK_Space; return true; }
+    if (strcmp(key, "Key.backspace") == 0) { *out_code = kVK_Delete; return true; }
+    if (strcmp(key, "Key.delete") == 0) { *out_code = kVK_ForwardDelete; return true; }
+    if (strcmp(key, "Key.esc") == 0) { *out_code = kVK_Escape; return true; }
+    if (strcmp(key, "Key.shift") == 0) { *out_code = kVK_Shift; return true; }
+    if (strcmp(key, "Key.shift_r") == 0) { *out_code = kVK_RightShift; return true; }
+    if (strcmp(key, "Key.ctrl") == 0) { *out_code = kVK_Control; return true; }
+    if (strcmp(key, "Key.ctrl_r") == 0) { *out_code = kVK_RightControl; return true; }
+    if (strcmp(key, "Key.alt") == 0) { *out_code = kVK_Option; return true; }
+    if (strcmp(key, "Key.alt_r") == 0) { *out_code = kVK_RightOption; return true; }
+    if (strcmp(key, "Key.cmd") == 0) { *out_code = kVK_Command; return true; }
+    if (strcmp(key, "Key.cmd_r") == 0) { *out_code = kVK_RightCommand; return true; }
+    if (strcmp(key, "Key.caps_lock") == 0) { *out_code = kVK_CapsLock; return true; }
+    if (strcmp(key, "Key.home") == 0) { *out_code = kVK_Home; return true; }
+    if (strcmp(key, "Key.end") == 0) { *out_code = kVK_End; return true; }
+    if (strcmp(key, "Key.page_up") == 0) { *out_code = kVK_PageUp; return true; }
+    if (strcmp(key, "Key.page_down") == 0) { *out_code = kVK_PageDown; return true; }
+    if (strcmp(key, "Key.insert") == 0) { *out_code = kVK_Help; return true; }
+    if (strcmp(key, "Key.left") == 0) { *out_code = kVK_LeftArrow; return true; }
+    if (strcmp(key, "Key.right") == 0) { *out_code = kVK_RightArrow; return true; }
+    if (strcmp(key, "Key.up") == 0) { *out_code = kVK_UpArrow; return true; }
+    if (strcmp(key, "Key.down") == 0) { *out_code = kVK_DownArrow; return true; }
+    if (strcmp(key, "Key.f1") == 0) { *out_code = kVK_F1; return true; }
+    if (strcmp(key, "Key.f2") == 0) { *out_code = kVK_F2; return true; }
+    if (strcmp(key, "Key.f3") == 0) { *out_code = kVK_F3; return true; }
+    if (strcmp(key, "Key.f4") == 0) { *out_code = kVK_F4; return true; }
+    if (strcmp(key, "Key.f5") == 0) { *out_code = kVK_F5; return true; }
+    if (strcmp(key, "Key.f6") == 0) { *out_code = kVK_F6; return true; }
+    if (strcmp(key, "Key.f7") == 0) { *out_code = kVK_F7; return true; }
+    if (strcmp(key, "Key.f8") == 0) { *out_code = kVK_F8; return true; }
+    if (strcmp(key, "Key.f9") == 0) { *out_code = kVK_F9; return true; }
+    if (strcmp(key, "Key.f10") == 0) { *out_code = kVK_F10; return true; }
+    if (strcmp(key, "Key.f11") == 0) { *out_code = kVK_F11; return true; }
+    if (strcmp(key, "Key.f12") == 0) { *out_code = kVK_F12; return true; }
+
+    if (strncmp(key, "Key.vk", 6) == 0) {
+        int vk = atoi(key + 6);
+        switch (vk) {
+            case 160: *out_code = kVK_Shift; return true;    /* VK_LSHIFT */
+            case 161: *out_code = kVK_RightShift; return true; /* VK_RSHIFT */
+            case 162: *out_code = kVK_Control; return true;  /* VK_LCONTROL */
+            case 163: *out_code = kVK_RightControl; return true; /* VK_RCONTROL */
+            case 164: *out_code = kVK_Option; return true;   /* VK_LMENU */
+            case 165: *out_code = kVK_RightOption; return true; /* VK_RMENU */
+            case 9:   *out_code = kVK_Tab; return true;      /* VK_TAB */
+            case 20:  *out_code = kVK_CapsLock; return true; /* VK_CAPITAL */
+            case 27:  *out_code = kVK_Escape; return true;   /* VK_ESCAPE */
+            case 32:  *out_code = kVK_Space; return true;    /* VK_SPACE */
+            case 13:  *out_code = kVK_Return; return true;   /* VK_RETURN */
+            case 8:   *out_code = kVK_Delete; return true;   /* VK_BACK */
+            case 46:  *out_code = kVK_ForwardDelete; return true; /* VK_DELETE */
+            case 45:  *out_code = kVK_Help; return true;     /* VK_INSERT */
+            case 36:  *out_code = kVK_Home; return true;     /* VK_HOME */
+            case 35:  *out_code = kVK_End; return true;      /* VK_END */
+            case 33:  *out_code = kVK_PageUp; return true;   /* VK_PRIOR */
+            case 34:  *out_code = kVK_PageDown; return true; /* VK_NEXT */
+            case 37:  *out_code = kVK_LeftArrow; return true; /* VK_LEFT */
+            case 38:  *out_code = kVK_UpArrow; return true;  /* VK_UP */
+            case 39:  *out_code = kVK_RightArrow; return true; /* VK_RIGHT */
+            case 40:  *out_code = kVK_DownArrow; return true; /* VK_DOWN */
+            case 91:  *out_code = kVK_Command; return true;  /* VK_LWIN */
+            case 92:  *out_code = kVK_RightCommand; return true; /* VK_RWIN */
+            default: break;
+        }
+    }
+
+    return false;
+}
+
+static bool macos_should_flip_y(void) {
+    static int cached = -1;
+    if (cached == -1) {
+        const char *env = getenv("MACOS_FLIP_Y");
+        if (env && env[0]) {
+            char c = env[0];
+            cached = (c == '1' || c == 't' || c == 'T' || c == 'y' || c == 'Y') ? 1 : 0;
+        } else {
+            cached = 0;
+        }
+        if (cached == 1) {
+            LOG_INFO("macOS: MACOS_FLIP_Y enabled (Y axis inverted)");
+        }
+    }
+    return cached == 1;
+}
+
+static void macos_adjust_injection_point(int *x, int *y) {
+    if (!macos_should_flip_y()) return;
+    int screen_h = (g_client.monitor_count > 0) ? g_client.monitors[0].height : 1080;
+    int adj_y = screen_h - *y;
+    if (adj_y < 0) adj_y = 0;
+    if (adj_y >= screen_h) adj_y = screen_h - 1;
+    *y = adj_y;
+}
+
+static void macos_get_event_point(ClientState *client, CGEventRef event, int *out_x, int *out_y) {
+    CGPoint point = CGEventGetLocation(event);
+    int x = (int)llround(point.x);
+    int y = (int)llround(point.y);
+
+    int screen_w = (client->monitor_count > 0) ? client->monitors[0].width : 1920;
+    int screen_h = (client->monitor_count > 0) ? client->monitors[0].height : 1080;
+
+    if (macos_should_flip_y()) {
+        y = screen_h - y;
+    }
+
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x >= screen_w) x = screen_w - 1;
+    if (y >= screen_h) y = screen_h - 1;
+
+    *out_x = x;
+    *out_y = y;
+}
+
+static CGEventRef macos_event_tap_callback(CGEventTapProxy proxy, CGEventType type,
+                                           CGEventRef event, void *refcon) {
+    UNUSED(proxy);
+    ClientState *client = (ClientState *)refcon;
+    if (!client) return event;
+
+    if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+        if (client->event_tap) {
+            CGEventTapEnable(client->event_tap, true);
+            LOG_WARN("macOS event tap re-enabled after disable");
+        }
+        return event;
+    }
+
+    if (!client->running) return event;
+    if (strcmp(client->config.role, "main") != 0) return event;
+    if (client->executing_input) return event;
+
+    bool block_local = !client->is_active;
+
+    switch (type) {
+        case kCGEventKeyDown:
+        case kCGEventKeyUp: {
+            bool is_press = (type == kCGEventKeyDown);
+            char key_name[64];
+            bool is_special = false;
+
+            if (macos_resolve_key_name(event, is_press, key_name, sizeof(key_name), &is_special)) {
+                char json[256];
+                snprintf(json, sizeof(json),
+                         "{\"action\":\"%s\",\"key\":\"%s\",\"is_special\":%s}",
+                         is_press ? "press" : "release",
+                         key_name,
+                         is_special ? "true" : "false");
+                if (is_press) {
+                    context_handle_key_event(client, key_name, is_special, true);
+                } else {
+                    context_handle_key_modifier_release(client, key_name);
+                }
+                send_input_event(client, "keyboard", json);
+            }
+            break;
+        }
+        case kCGEventFlagsChanged: {
+            CGKeyCode code = (CGKeyCode)CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+            const char *special = NULL;
+            if (macos_keycode_to_special(code, &special)) {
+                CGEventFlags flags = CGEventGetFlags(event);
+                bool is_press = false;
+                switch (code) {
+                    case kVK_Shift:
+                    case kVK_RightShift:
+                        is_press = (flags & kCGEventFlagMaskShift) != 0;
+                        break;
+                    case kVK_Control:
+                    case kVK_RightControl:
+                        is_press = (flags & kCGEventFlagMaskControl) != 0;
+                        break;
+                    case kVK_Option:
+                    case kVK_RightOption:
+                        is_press = (flags & kCGEventFlagMaskAlternate) != 0;
+                        break;
+                    case kVK_Command:
+                    case kVK_RightCommand:
+                        is_press = (flags & kCGEventFlagMaskCommand) != 0;
+                        break;
+                    case kVK_CapsLock:
+                        is_press = (flags & kCGEventFlagMaskAlphaShift) != 0;
+                        break;
+                    default:
+                        break;
+                }
+
+                char json[256];
+                snprintf(json, sizeof(json),
+                         "{\"action\":\"%s\",\"key\":\"%s\",\"is_special\":true}",
+                         is_press ? "press" : "release", special);
+                if (is_press) {
+                    context_handle_key_event(client, special, true, true);
+                } else {
+                    context_handle_key_modifier_release(client, special);
+                }
+                send_input_event(client, "keyboard", json);
+            }
+            break;
+        }
+        case kCGEventMouseMoved:
+        case kCGEventLeftMouseDragged:
+        case kCGEventRightMouseDragged:
+        case kCGEventOtherMouseDragged: {
+            if (client->skip_mouse_moves > 0) {
+                client->skip_mouse_moves--;
+                break;
+            }
+
+            int x = 0, y = 0;
+            macos_get_event_point(client, event, &x, &y);
+
+            static double last_move_time = 0;
+            static int last_x = -1, last_y = -1;
+            double now = get_time_ms();
+
+            if (now - last_move_time >= 16 && (x != last_x || y != last_y)) {
+                context_handle_mouse_move(client, x, y);
+                send_mouse_move_fast(client, x, y, now);
+                last_move_time = now;
+                last_x = x;
+                last_y = y;
+
+                /* Edge detection when active */
+                if (client->is_active) {
+                    int screen_w = (client->monitor_count > 0) ? client->monitors[0].width : 1920;
+                    int screen_h = (client->monitor_count > 0) ? client->monitors[0].height : 1080;
+                    bool at_edge = (x <= 5 || x >= screen_w - 5 ||
+                                   y <= 5 || y >= screen_h - 5);
+                    if (at_edge) {
+                        const char *edge = NULL;
+                        float position = 0.0f;
+                        if (x <= 5) {
+                            edge = "left";
+                            position = (float)y / screen_h;
+                        } else if (x >= screen_w - 5) {
+                            edge = "right";
+                            position = (float)y / screen_h;
+                        } else if (y <= 5) {
+                            edge = "top";
+                            position = (float)x / screen_w;
+                        } else if (y >= screen_h - 5) {
+                            edge = "bottom";
+                            position = (float)x / screen_w;
+                        }
+
+                        if (edge) {
+                            static double last_edge_request_time = 0;
+                            if (now - last_edge_request_time >= 200) {
+                                send_edge_crossing_request(client, edge, position, x, y);
+                                last_edge_request_time = now;
+                            }
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        case kCGEventLeftMouseDown:
+        case kCGEventLeftMouseUp:
+        case kCGEventRightMouseDown:
+        case kCGEventRightMouseUp:
+        case kCGEventOtherMouseDown:
+        case kCGEventOtherMouseUp: {
+            int x = 0, y = 0;
+            macos_get_event_point(client, event, &x, &y);
+            const char *button = "Button.left";
+            const char *action = (type == kCGEventLeftMouseDown ||
+                                  type == kCGEventRightMouseDown ||
+                                  type == kCGEventOtherMouseDown) ? "press" : "release";
+            if (type == kCGEventRightMouseDown || type == kCGEventRightMouseUp) {
+                button = "Button.right";
+            } else if (type == kCGEventOtherMouseDown || type == kCGEventOtherMouseUp) {
+                button = "Button.middle";
+            }
+
+            char json[256];
+            snprintf(json, sizeof(json),
+                     "{\"action\":\"%s\",\"button\":\"%s\",\"x\":%d,\"y\":%d}",
+                     action, button, x, y);
+            context_handle_mouse_click(client, x, y, button, action);
+            send_input_event(client, "mouse_click", json);
+            break;
+        }
+        case kCGEventScrollWheel: {
+            int x = 0, y = 0;
+            macos_get_event_point(client, event, &x, &y);
+            int dy = (int)CGEventGetIntegerValueField(event, kCGScrollWheelEventDeltaAxis1);
+            int dx = (int)CGEventGetIntegerValueField(event, kCGScrollWheelEventDeltaAxis2);
+            int out_dx = (dx > 0) ? 1 : (dx < 0 ? -1 : 0);
+            int out_dy = (dy > 0) ? 1 : (dy < 0 ? -1 : 0);
+            if (out_dx != 0 || out_dy != 0) {
+                char json[128];
+                snprintf(json, sizeof(json), "{\"dx\":%d,\"dy\":%d}", out_dx, out_dy);
+                context_handle_mouse_scroll(client, x, y, out_dx, out_dy);
+                send_input_event(client, "mouse_scroll", json);
+            }
+            break;
+        }
+        default:
+            break;
+    }
+
+    return block_local ? NULL : event;
+}
+
+static void* macos_input_capture_thread(void *arg) {
+    ClientState *client = (ClientState *)arg;
+    if (!client) return NULL;
+
+    CGEventMask mask = 0;
+    mask |= CGEventMaskBit(kCGEventKeyDown);
+    mask |= CGEventMaskBit(kCGEventKeyUp);
+    mask |= CGEventMaskBit(kCGEventFlagsChanged);
+    mask |= CGEventMaskBit(kCGEventMouseMoved);
+    mask |= CGEventMaskBit(kCGEventLeftMouseDragged);
+    mask |= CGEventMaskBit(kCGEventRightMouseDragged);
+    mask |= CGEventMaskBit(kCGEventOtherMouseDragged);
+    mask |= CGEventMaskBit(kCGEventLeftMouseDown);
+    mask |= CGEventMaskBit(kCGEventLeftMouseUp);
+    mask |= CGEventMaskBit(kCGEventRightMouseDown);
+    mask |= CGEventMaskBit(kCGEventRightMouseUp);
+    mask |= CGEventMaskBit(kCGEventOtherMouseDown);
+    mask |= CGEventMaskBit(kCGEventOtherMouseUp);
+    mask |= CGEventMaskBit(kCGEventScrollWheel);
+
+    client->event_tap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
+                                         kCGEventTapOptionDefault, mask,
+                                         macos_event_tap_callback, client);
+    if (!client->event_tap) {
+        LOG_ERROR("macOS: failed to create event tap (enable Input Monitoring permission)");
+        client->input_thread_running = false;
+        return NULL;
+    }
+
+    client->run_loop_source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault,
+                                                            client->event_tap, 0);
+    if (!client->run_loop_source) {
+        LOG_ERROR("macOS: failed to create run loop source for event tap");
+        CFMachPortInvalidate(client->event_tap);
+        CFRelease(client->event_tap);
+        client->event_tap = NULL;
+        client->input_thread_running = false;
+        return NULL;
+    }
+
+    client->run_loop = CFRunLoopGetCurrent();
+    CFRetain(client->run_loop);
+    CFRunLoopAddSource(client->run_loop, client->run_loop_source, kCFRunLoopCommonModes);
+    CGEventTapEnable(client->event_tap, true);
+
+    LOG_INFO("macOS input capture thread started (event tap)");
+
+    while (client->input_thread_running && client->running && !g_shutdown) {
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, true);
+    }
+
+    LOG_INFO("macOS input capture thread stopping");
+
+    if (client->run_loop && client->run_loop_source) {
+        CFRunLoopRemoveSource(client->run_loop, client->run_loop_source, kCFRunLoopCommonModes);
+    }
+    if (client->run_loop_source) {
+        CFRelease(client->run_loop_source);
+        client->run_loop_source = NULL;
+    }
+    if (client->event_tap) {
+        CFMachPortInvalidate(client->event_tap);
+        CFRelease(client->event_tap);
+        client->event_tap = NULL;
+    }
+    if (client->run_loop) {
+        CFRelease(client->run_loop);
+        client->run_loop = NULL;
+    }
+
+    return NULL;
+}
+
 static void inject_key_macos(const char *key, bool is_special, bool press) {
-    /* TODO: Implement macOS key injection using CGEventPost */
-    CGEventRef event = CGEventCreateKeyboardEvent(NULL, 0, press);
+    if (!key || !key[0]) return;
+
+    if (!is_special && strlen(key) == 1) {
+        UniChar ch = (UniChar)key[0];
+        CGEventRef event = CGEventCreateKeyboardEvent(NULL, (CGKeyCode)0, press);
+        if (!event) return;
+        CGEventKeyboardSetUnicodeString(event, 1, &ch);
+        CGEventPost(kCGHIDEventTap, event);
+        CFRelease(event);
+        return;
+    }
+
+    CGKeyCode code = 0;
+    if (!macos_key_name_to_keycode(key, &code)) {
+        LOG_WARN("Unknown macOS key: %s", key);
+        return;
+    }
+
+    CGEventRef event = CGEventCreateKeyboardEvent(NULL, code, press);
+    if (!event) return;
     CGEventPost(kCGHIDEventTap, event);
     CFRelease(event);
 }
 
 static void inject_mouse_move_macos(int x, int y) {
+    macos_adjust_injection_point(&x, &y);
     CGPoint point = CGPointMake(x, y);
     CGEventRef event = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved, point, kCGMouseButtonLeft);
     CGEventPost(kCGHIDEventTap, event);
@@ -4443,10 +5011,10 @@ static void inject_mouse_button_macos(const char *button, bool press) {
     CGEventRef moveEvent = CGEventCreate(NULL);
     point = CGEventGetLocation(moveEvent);
     CFRelease(moveEvent);
-    
+
     CGMouseButton btn = kCGMouseButtonLeft;
     CGEventType eventType;
-    
+
     if (strcmp(button, "Button.left") == 0) {
         btn = kCGMouseButtonLeft;
         eventType = press ? kCGEventLeftMouseDown : kCGEventLeftMouseUp;
@@ -4457,8 +5025,16 @@ static void inject_mouse_button_macos(const char *button, bool press) {
         btn = kCGMouseButtonCenter;
         eventType = press ? kCGEventOtherMouseDown : kCGEventOtherMouseUp;
     }
-    
+
     CGEventRef event = CGEventCreateMouseEvent(NULL, eventType, point, btn);
+    CGEventPost(kCGHIDEventTap, event);
+    CFRelease(event);
+}
+
+static void inject_mouse_scroll_macos(int dx, int dy) {
+    if (dx == 0 && dy == 0) return;
+    CGEventRef event = CGEventCreateScrollWheelEvent(NULL, kCGScrollEventUnitLine, 2, dy, dx);
+    if (!event) return;
     CGEventPost(kCGHIDEventTap, event);
     CFRelease(event);
 }
@@ -5867,8 +6443,16 @@ static void handle_input_event(ClientState *client, JsonValue *msg) {
         inject_mouse_move_macos((int)json_get_number(data, "x", 0),
                                  (int)json_get_number(data, "y", 0));
     } else if (strcmp(event_type, "mouse_click") == 0) {
-        inject_mouse_button_macos(json_get_string(data, "button", "Button.left"),
-                                   strcmp(json_get_string(data, "action", ""), "press") == 0);
+        const char *button = json_get_string(data, "button", "Button.left");
+        const char *action = json_get_string(data, "action", "");
+        double x = json_get_number(data, "x", 0);
+        double y = json_get_number(data, "y", 0);
+        inject_mouse_move_macos((int)x, (int)y);
+        inject_mouse_button_macos(button, strcmp(action, "press") == 0);
+    } else if (strcmp(event_type, "mouse_scroll") == 0) {
+        int dx = (int)json_get_number(data, "dx", 0);
+        int dy = (int)json_get_number(data, "dy", 0);
+        inject_mouse_scroll_macos(dx, dy);
     }
 #endif
     
@@ -5924,6 +6508,19 @@ static void apply_active_monitor_changed(ClientState *client,
         /* Show cursor */
         while (ShowCursor(TRUE) < 0);  /* Ensure cursor is visible */
 #endif
+#ifdef PLATFORM_MACOS
+        /* Set cursor to server position */
+        if (cursor_x >= 0 && cursor_y >= 0) {
+            client->skip_mouse_moves = 10;
+            int cx = (int)cursor_x;
+            int cy = (int)cursor_y;
+            macos_adjust_injection_point(&cx, &cy);
+            CGWarpMouseCursorPosition(CGPointMake(cx, cy));
+            CGAssociateMouseAndMouseCursorPosition(true);
+            LOG_INFO("Set cursor to (%.0f, %.0f)", cursor_x, cursor_y);
+        }
+        CGDisplayShowCursor(kCGDirectMainDisplay);
+#endif
         LOG_INFO("This computer is now ACTIVE - local input enabled");
 
     } else {
@@ -5966,6 +6563,21 @@ static void apply_active_monitor_changed(ClientState *client,
         }
         /* Hide cursor */
         while (ShowCursor(FALSE) >= 0);  /* Hide cursor */
+#endif
+#ifdef PLATFORM_MACOS
+        if (strcmp(client->config.role, "main") == 0) {
+            LOG_INFO("macOS main inactive: local input blocked by event tap");
+        }
+        if (client->monitor_count > 0) {
+            int cx = client->monitors[0].width / 2;
+            int cy = client->monitors[0].height / 2;
+            client->skip_mouse_moves = 5;
+            macos_adjust_injection_point(&cx, &cy);
+            CGWarpMouseCursorPosition(CGPointMake(cx, cy));
+            CGAssociateMouseAndMouseCursorPosition(true);
+            LOG_INFO("Pinned cursor to center (%d, %d)", cx, cy);
+        }
+        CGDisplayHideCursor(kCGDirectMainDisplay);
 #endif
         LOG_INFO("This computer is INACTIVE - local input blocked");
     }
@@ -6700,6 +7312,25 @@ static void client_cleanup(ClientState *client) {
     /* Show cursor */
     while (ShowCursor(TRUE) < 0);
 #endif
+#ifdef PLATFORM_MACOS
+    /* Stop macOS input capture thread */
+    if (client->input_thread_running) {
+        client->input_thread_running = false;
+        if (client->run_loop) {
+            CFRunLoopStop(client->run_loop);
+        }
+        pthread_join(client->input_thread, NULL);
+    }
+
+    /* Stop clipboard monitor thread */
+    if (client->clipboard_thread_running) {
+        client->clipboard_thread_running = false;
+        pthread_join(client->clipboard_thread, NULL);
+    }
+
+    /* Show cursor */
+    CGDisplayShowCursor(kCGDirectMainDisplay);
+#endif
     /* Flush and close context log */
     context_logger_shutdown(client);
 
@@ -7343,6 +7974,17 @@ int main(int argc, char *argv[]) {
             LOG_WARN("Windows input hooks not available - input capture disabled");
         }
 #endif
+#ifdef PLATFORM_MACOS
+        /* Start macOS input capture (event tap) */
+        if (strcmp(g_client.config.role, "main") == 0) {
+            g_client.input_thread_running = true;
+            if (pthread_create(&g_client.input_thread, NULL,
+                               macos_input_capture_thread, &g_client) != 0) {
+                LOG_ERROR("Failed to create macOS input capture thread");
+                g_client.input_thread_running = false;
+            }
+        }
+#endif
 
         /* Start clipboard monitor thread for server mode too */
         g_client.clipboard_thread_running = true;
@@ -7574,6 +8216,25 @@ int main(int argc, char *argv[]) {
             g_client.clipboard_thread_running = false;
         }
 #endif
+#ifdef PLATFORM_MACOS
+        /* Start macOS input capture for main role */
+        if (strcmp(g_client.config.role, "main") == 0) {
+            g_client.input_thread_running = true;
+            if (pthread_create(&g_client.input_thread, NULL,
+                               macos_input_capture_thread, &g_client) != 0) {
+                LOG_ERROR("Failed to create macOS input capture thread");
+                g_client.input_thread_running = false;
+            }
+        }
+
+        /* Start clipboard monitor thread for all roles */
+        g_client.clipboard_thread_running = true;
+        if (pthread_create(&g_client.clipboard_thread, NULL,
+                           clipboard_monitor_thread, &g_client) != 0) {
+            LOG_ERROR("Failed to create clipboard monitor thread");
+            g_client.clipboard_thread_running = false;
+        }
+#endif
         
         /* Main event loop */
         while (g_client.connected && g_client.running && !g_shutdown) {
@@ -7651,6 +8312,22 @@ int main(int argc, char *argv[]) {
         }
 #endif
 #ifdef PLATFORM_WINDOWS
+        /* Stop clipboard monitor thread */
+        if (g_client.clipboard_thread_running) {
+            g_client.clipboard_thread_running = false;
+            pthread_join(g_client.clipboard_thread, NULL);
+        }
+#endif
+#ifdef PLATFORM_MACOS
+        /* Stop input capture thread */
+        if (g_client.input_thread_running) {
+            g_client.input_thread_running = false;
+            if (g_client.run_loop) {
+                CFRunLoopStop(g_client.run_loop);
+            }
+            pthread_join(g_client.input_thread, NULL);
+        }
+
         /* Stop clipboard monitor thread */
         if (g_client.clipboard_thread_running) {
             g_client.clipboard_thread_running = false;
