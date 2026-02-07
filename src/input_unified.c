@@ -33,6 +33,8 @@
 #include <signal.h>
 #include <errno.h>
 #include <math.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 
 /* Cross-compiler attribute macros */
 #ifdef _MSC_VER
@@ -120,6 +122,9 @@
     #include <Carbon/Carbon.h>
     /* Note: IOKit HID requires more complex setup */
 #endif
+
+/* Forward declarations for helpers defined later */
+static char* get_local_ip(void);
 
 /* libwebsockets for WebSocket support */
 #include <libwebsockets.h>
