@@ -109,12 +109,15 @@
     #include <pthread.h>
     #include <sys/select.h>
     #include <sys/time.h>
+    #include <sys/types.h>
+    #include <sys/stat.h>
     #include <netdb.h>
     #include <arpa/inet.h>
     #include <sys/socket.h>
     #include <CoreFoundation/CoreFoundation.h>
     #include <CoreGraphics/CoreGraphics.h>
     #include <ApplicationServices/ApplicationServices.h>
+    #include <Carbon/Carbon.h>
     /* Note: IOKit HID requires more complex setup */
 #endif
 
@@ -262,6 +265,10 @@ typedef struct {
     CRITICAL_SECTION cs;
     bool cs_initialized;
 #endif
+#ifdef PLATFORM_MACOS
+    pthread_mutex_t mutex;
+    bool mutex_initialized;
+#endif
 } ContextLogger;
 
 /* Thread-safe message queue for WebSocket sending */
@@ -276,6 +283,9 @@ typedef struct {
 #ifdef PLATFORM_WINDOWS
     CRITICAL_SECTION cs;
     bool cs_initialized;
+#endif
+#ifdef PLATFORM_MACOS
+    pthread_mutex_t mutex;
 #endif
 } MessageQueue;
 
@@ -348,6 +358,9 @@ typedef struct {
 #ifdef PLATFORM_MACOS
     CFMachPortRef event_tap;
     CFRunLoopSourceRef run_loop_source;
+    CFRunLoopRef run_loop;
+    pthread_t input_thread;
+    bool input_thread_running;
 #endif
     
 } ClientState;
@@ -650,6 +663,9 @@ static void msg_queue_init(MessageQueue *q) {
     InitializeCriticalSection(&q->cs);
     q->cs_initialized = true;
 #endif
+#ifdef PLATFORM_MACOS
+    pthread_mutex_init(&q->mutex, NULL);
+#endif
 }
 
 static void msg_queue_destroy(MessageQueue *q) {
@@ -661,6 +677,9 @@ static void msg_queue_destroy(MessageQueue *q) {
         DeleteCriticalSection(&q->cs);
         q->cs_initialized = false;
     }
+#endif
+#ifdef PLATFORM_MACOS
+    pthread_mutex_destroy(&q->mutex);
 #endif
 }
 
@@ -674,6 +693,9 @@ static bool msg_queue_push(MessageQueue *q, const char *msg) {
 #endif
 #ifdef PLATFORM_WINDOWS
     if (q->cs_initialized) EnterCriticalSection(&q->cs);
+#endif
+#ifdef PLATFORM_MACOS
+    pthread_mutex_lock(&q->mutex);
 #endif
 
     if (len >= MSG_MAX_LEN) {
@@ -696,6 +718,9 @@ static bool msg_queue_push(MessageQueue *q, const char *msg) {
 #ifdef PLATFORM_WINDOWS
     if (q->cs_initialized) LeaveCriticalSection(&q->cs);
 #endif
+#ifdef PLATFORM_MACOS
+    pthread_mutex_unlock(&q->mutex);
+#endif
     return success;
 }
 
@@ -707,6 +732,9 @@ static bool msg_queue_pop(MessageQueue *q, char *out_msg, size_t out_size) {
 #endif
 #ifdef PLATFORM_WINDOWS
     if (q->cs_initialized) EnterCriticalSection(&q->cs);
+#endif
+#ifdef PLATFORM_MACOS
+    pthread_mutex_lock(&q->mutex);
 #endif
 
     if (q->count > 0) {
@@ -723,6 +751,9 @@ static bool msg_queue_pop(MessageQueue *q, char *out_msg, size_t out_size) {
 #ifdef PLATFORM_WINDOWS
     if (q->cs_initialized) LeaveCriticalSection(&q->cs);
 #endif
+#ifdef PLATFORM_MACOS
+    pthread_mutex_unlock(&q->mutex);
+#endif
     return success;
 }
 
@@ -735,12 +766,18 @@ static bool msg_queue_has_messages(MessageQueue *q) {
 #ifdef PLATFORM_WINDOWS
     if (q->cs_initialized) EnterCriticalSection(&q->cs);
 #endif
+#ifdef PLATFORM_MACOS
+    pthread_mutex_lock(&q->mutex);
+#endif
     has = (q->count > 0);
 #ifdef PLATFORM_LINUX
     pthread_mutex_unlock(&q->mutex);
 #endif
 #ifdef PLATFORM_WINDOWS
     if (q->cs_initialized) LeaveCriticalSection(&q->cs);
+#endif
+#ifdef PLATFORM_MACOS
+    pthread_mutex_unlock(&q->mutex);
 #endif
     return has;
 }
@@ -754,12 +791,18 @@ static int msg_queue_count(MessageQueue *q) {
 #ifdef PLATFORM_WINDOWS
     if (q->cs_initialized) EnterCriticalSection(&q->cs);
 #endif
+#ifdef PLATFORM_MACOS
+    pthread_mutex_lock(&q->mutex);
+#endif
     count = q->count;
 #ifdef PLATFORM_LINUX
     pthread_mutex_unlock(&q->mutex);
 #endif
 #ifdef PLATFORM_WINDOWS
     if (q->cs_initialized) LeaveCriticalSection(&q->cs);
+#endif
+#ifdef PLATFORM_MACOS
+    pthread_mutex_unlock(&q->mutex);
 #endif
     return count;
 }
@@ -772,6 +815,9 @@ static void msg_queue_clear(MessageQueue *q) {
 #ifdef PLATFORM_WINDOWS
     if (q->cs_initialized) EnterCriticalSection(&q->cs);
 #endif
+#ifdef PLATFORM_MACOS
+    pthread_mutex_lock(&q->mutex);
+#endif
     int cleared = q->count;
     q->head = 0;
     q->tail = 0;
@@ -781,6 +827,9 @@ static void msg_queue_clear(MessageQueue *q) {
 #endif
 #ifdef PLATFORM_WINDOWS
     if (q->cs_initialized) LeaveCriticalSection(&q->cs);
+#endif
+#ifdef PLATFORM_MACOS
+    pthread_mutex_unlock(&q->mutex);
 #endif
     if (cleared > 0) {
         LOG_INFO("Cleared %d stale messages from queue", cleared);
@@ -1341,6 +1390,9 @@ static void context_lock(ContextLogger *ctx) {
 #ifdef PLATFORM_WINDOWS
     if (ctx->cs_initialized) EnterCriticalSection(&ctx->cs);
 #endif
+#ifdef PLATFORM_MACOS
+    if (ctx->mutex_initialized) pthread_mutex_lock(&ctx->mutex);
+#endif
 }
 
 static void context_unlock(ContextLogger *ctx) {
@@ -1349,6 +1401,9 @@ static void context_unlock(ContextLogger *ctx) {
 #endif
 #ifdef PLATFORM_WINDOWS
     if (ctx->cs_initialized) LeaveCriticalSection(&ctx->cs);
+#endif
+#ifdef PLATFORM_MACOS
+    if (ctx->mutex_initialized) pthread_mutex_unlock(&ctx->mutex);
 #endif
 }
 
@@ -2099,6 +2154,10 @@ static void context_logger_init(ClientState *client) {
     InitializeCriticalSection(&ctx->cs);
     ctx->cs_initialized = true;
 #endif
+#ifdef PLATFORM_MACOS
+    pthread_mutex_init(&ctx->mutex, NULL);
+    ctx->mutex_initialized = true;
+#endif
 
     const char *format = client->config.context_format[0] ? client->config.context_format : "json";
     strncpy(ctx->format, format, sizeof(ctx->format) - 1);
@@ -2245,6 +2304,12 @@ static void context_logger_shutdown(ClientState *client) {
     if (ctx->cs_initialized) {
         DeleteCriticalSection(&ctx->cs);
         ctx->cs_initialized = false;
+    }
+#endif
+#ifdef PLATFORM_MACOS
+    if (ctx->mutex_initialized) {
+        pthread_mutex_destroy(&ctx->mutex);
+        ctx->mutex_initialized = false;
     }
 #endif
 }
@@ -2987,11 +3052,67 @@ static bool clipboard_set_windows(const char *content, size_t len) {
 }
 #endif
 
+#ifdef PLATFORM_MACOS
+/* Get clipboard content using pbpaste */
+static char* clipboard_get_macos(void) {
+    FILE *fp = popen("pbpaste 2>/dev/null", "r");
+    if (!fp) {
+        return NULL;
+    }
+
+    char *content = (char*)malloc(CLIPBOARD_MAX_SIZE);
+    if (!content) {
+        pclose(fp);
+        return NULL;
+    }
+
+    size_t total_read = 0;
+    size_t bytes_read;
+    while ((bytes_read = fread(content + total_read, 1,
+                                CLIPBOARD_MAX_SIZE - total_read - 1, fp)) > 0) {
+        total_read += bytes_read;
+        if (total_read >= CLIPBOARD_MAX_SIZE - 1) break;
+    }
+    content[total_read] = '\0';
+
+    int status = pclose(fp);
+    if (status != 0 || total_read == 0) {
+        free(content);
+        return NULL;
+    }
+
+    return content;
+}
+
+/* Set clipboard content using pbcopy */
+static bool clipboard_set_macos(const char *content, size_t len) {
+    if (!content || len == 0) return false;
+
+    FILE *fp = popen("pbcopy 2>/dev/null", "w");
+    if (!fp) {
+        LOG_WARN("ðŸ“‹ Failed to open pbcopy for writing");
+        return false;
+    }
+
+    size_t written = fwrite(content, 1, len, fp);
+    int status = pclose(fp);
+
+    if (status != 0 || written != len) {
+        LOG_WARN("ðŸ“‹ pbcopy write failed (wrote %zu/%zu, status %d)", written, len, status);
+        return false;
+    }
+
+    return true;
+}
+#endif
+
 static char* clipboard_get(void) {
 #ifdef PLATFORM_LINUX
     return clipboard_get_linux();
 #elif defined(PLATFORM_WINDOWS)
     return clipboard_get_windows();
+#elif defined(PLATFORM_MACOS)
+    return clipboard_get_macos();
 #else
     return NULL;
 #endif
@@ -3002,6 +3123,8 @@ static bool clipboard_set(const char *content, size_t len) {
     return clipboard_set_linux(content, len);
 #elif defined(PLATFORM_WINDOWS)
     return clipboard_set_windows(content, len);
+#elif defined(PLATFORM_MACOS)
+    return clipboard_set_macos(content, len);
 #else
     UNUSED(content);
     UNUSED(len);
@@ -6810,6 +6933,30 @@ static char* get_local_ip(void) {
 }
 #endif
 
+#ifdef PLATFORM_MACOS
+static char* get_local_ip(void) {
+    static char ip[64] = "127.0.0.1";
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) return ip;
+
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = inet_addr("8.8.8.8");
+    addr.sin_port = htons(80);
+
+    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+        struct sockaddr_in local;
+        socklen_t len = sizeof(local);
+        if (getsockname(sock, (struct sockaddr*)&local, &len) == 0) {
+            strncpy(ip, inet_ntoa(local.sin_addr), sizeof(ip) - 1);
+        }
+    }
+
+    close(sock);
+    return ip;
+}
+#endif
+
 static void signal_handler(int sig) {
     LOG_INFO("Signal %d received, shutting down...", sig);
     g_shutdown = 1;
@@ -7535,5 +7682,3 @@ int main(int argc, char *argv[]) {
     cleanup_logging();
     return 0;
 }
-
-
