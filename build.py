@@ -144,6 +144,24 @@ def configure(platform_name: str, cfg: str, generator: str | None) -> Path:
             log(f"[INFO] Using vcpkg toolchain: {toolchain}")
         elif toolchain:
             log(f"[WARN] VCPKG toolchain not found at {toolchain}. Continuing without vcpkg.")
+
+        # Pass OpenSSL hints if provided in .env
+        openssl_root = os.environ.get("OPENSSL_ROOT_DIR")
+        openssl_inc = os.environ.get("OPENSSL_INCLUDE_DIR")
+        openssl_crypto = os.environ.get("OPENSSL_CRYPTO_LIBRARY")
+        openssl_ssl = os.environ.get("OPENSSL_SSL_LIBRARY")
+        if openssl_root:
+            args += [f"-DOPENSSL_ROOT_DIR={openssl_root}"]
+        if openssl_inc:
+            args += [f"-DOPENSSL_INCLUDE_DIR={openssl_inc}"]
+        if openssl_crypto:
+            args += [f"-DOPENSSL_CRYPTO_LIBRARY={openssl_crypto}"]
+        if openssl_ssl:
+            args += [f"-DOPENSSL_SSL_LIBRARY={openssl_ssl}"]
+
+        if not toolchain and not (openssl_root or openssl_inc or openssl_crypto or openssl_ssl):
+            log("[ERROR] OpenSSL not found and no vcpkg toolchain set. Set OPENSSL_ROOT_DIR or install vcpkg and set VCPKG_INSTALLATION_ROOT/VCPKG_TOOLCHAIN_FILE.")
+            raise SystemExit(1)
         args += [
             f"-DCMAKE_RUNTIME_OUTPUT_DIRECTORY={build_dir / 'bin'}",
             f"-DCMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE={build_dir / 'bin' / 'Release'}",
