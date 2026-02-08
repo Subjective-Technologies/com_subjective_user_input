@@ -59,6 +59,18 @@ def cached_generator(build_dir: Path) -> str | None:
     return None
 
 
+def cached_toolchain(build_dir: Path) -> Path | None:
+    cache = build_dir / "CMakeCache.txt"
+    if not cache.exists():
+        return None
+    for line in cache.read_text(errors="ignore").splitlines():
+        if line.startswith("CMAKE_TOOLCHAIN_FILE:"):
+            parts = line.split("=", 1)
+            if len(parts) == 2:
+                return Path(parts[1].strip())
+    return None
+
+
 def detect_vs_generator() -> str | None:
     """Try to detect an installed Visual Studio generator via vswhere."""
     vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
@@ -97,6 +109,7 @@ def configure(platform_name: str, cfg: str, generator: str | None) -> Path:
     build_dir.mkdir(parents=True, exist_ok=True)
 
     cached_gen = cached_generator(build_dir)
+    cached_tc = cached_toolchain(build_dir)
     chosen_gen = generator or os.environ.get("CMAKE_GENERATOR") or cached_gen
 
     args = ["cmake", "-S", str(ROOT), "-B", str(build_dir)]
@@ -111,6 +124,7 @@ def configure(platform_name: str, cfg: str, generator: str | None) -> Path:
             import shutil
             shutil.rmtree(build_dir)
             build_dir.mkdir(parents=True, exist_ok=True)
+            cached_tc = None
         args += ["-G", gen, "-A", "x64"]
         vcpkg_root = os.environ.get("VCPKG_INSTALLATION_ROOT")
         toolchain_env = os.environ.get("VCPKG_TOOLCHAIN_FILE")
@@ -119,6 +133,12 @@ def configure(platform_name: str, cfg: str, generator: str | None) -> Path:
             toolchain = Path(toolchain_env)
         elif vcpkg_root:
             toolchain = Path(vcpkg_root) / "scripts" / "buildsystems" / "vcpkg.cmake"
+        if cached_tc and not cached_tc.exists():
+            log(f"[WARN] Cached toolchain missing ({cached_tc}); clearing {build_dir}")
+            import shutil
+            shutil.rmtree(build_dir)
+            build_dir.mkdir(parents=True, exist_ok=True)
+            cached_tc = None
         if toolchain and toolchain.exists():
             args += [f"-DCMAKE_TOOLCHAIN_FILE={toolchain}"]
             log(f"[INFO] Using vcpkg toolchain: {toolchain}")
