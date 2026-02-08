@@ -112,9 +112,18 @@ def configure(platform_name: str, cfg: str, generator: str | None) -> Path:
             shutil.rmtree(build_dir)
             build_dir.mkdir(parents=True, exist_ok=True)
         args += ["-G", gen, "-A", "x64"]
-        vcpkg = os.environ.get("VCPKG_INSTALLATION_ROOT")
-        if vcpkg:
-            args += [f"-DCMAKE_TOOLCHAIN_FILE={Path(vcpkg) / 'scripts' / 'buildsystems' / 'vcpkg.cmake'}"]
+        vcpkg_root = os.environ.get("VCPKG_INSTALLATION_ROOT")
+        toolchain_env = os.environ.get("VCPKG_TOOLCHAIN_FILE")
+        toolchain = None
+        if toolchain_env:
+            toolchain = Path(toolchain_env)
+        elif vcpkg_root:
+            toolchain = Path(vcpkg_root) / "scripts" / "buildsystems" / "vcpkg.cmake"
+        if toolchain and toolchain.exists():
+            args += [f"-DCMAKE_TOOLCHAIN_FILE={toolchain}"]
+            log(f"[INFO] Using vcpkg toolchain: {toolchain}")
+        elif toolchain:
+            log(f"[WARN] VCPKG toolchain not found at {toolchain}. Continuing without vcpkg.")
         args += [
             f"-DCMAKE_RUNTIME_OUTPUT_DIRECTORY={build_dir / 'bin'}",
             f"-DCMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE={build_dir / 'bin' / 'Release'}",
