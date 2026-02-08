@@ -12,6 +12,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -47,7 +48,7 @@ def configure(platform_name: str, cfg: str, generator: str | None) -> Path:
     if platform_name == "windows":
         gen = generator or "Visual Studio 17 2022"
         args += ["-G", gen, "-A", "x64"]
-        vcpkg = sys.environ.get("VCPKG_INSTALLATION_ROOT")
+        vcpkg = os.environ.get("VCPKG_INSTALLATION_ROOT")
         if vcpkg:
             args += [f"-DCMAKE_TOOLCHAIN_FILE={Path(vcpkg) / 'scripts' / 'buildsystems' / 'vcpkg.cmake'}"]
         args += [
