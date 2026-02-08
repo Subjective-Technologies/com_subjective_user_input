@@ -28,6 +28,37 @@ def run(cmd: list[str]) -> None:
     subprocess.run(cmd, check=True)
 
 
+def load_root_env() -> None:
+    env_path = ROOT.parent.parent / ".env"
+    if not env_path.exists():
+        return
+    loaded = 0
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        if k and v and k not in os.environ:
+            os.environ[k] = v
+            loaded += 1
+    if loaded:
+        log(f"[INFO] Loaded {loaded} vars from {env_path}")
+
+
+def cached_generator(build_dir: Path) -> str | None:
+    cache = build_dir / "CMakeCache.txt"
+    if not cache.exists():
+        return None
+    for line in cache.read_text(errors="ignore").splitlines():
+        if line.startswith("CMAKE_GENERATOR:"):
+            parts = line.split("=", 1)
+            if len(parts) == 2:
+                return parts[1].strip()
+    return None
+
+
 def detect_platform() -> str:
     sys_name = platform.system().lower()
     if "windows" in sys_name:
@@ -43,10 +74,20 @@ def configure(platform_name: str, cfg: str, generator: str | None) -> Path:
     build_dir = BUILD_ROOT / platform_name
     build_dir.mkdir(parents=True, exist_ok=True)
 
+    cached_gen = cached_generator(build_dir)
+    chosen_gen = generator or os.environ.get("CMAKE_GENERATOR") or cached_gen
+
     args = ["cmake", "-S", str(ROOT), "-B", str(build_dir)]
 
     if platform_name == "windows":
-        gen = generator or "Visual Studio 17 2022"
+        default_gen = "Visual Studio 17 2022"
+        # Prefer a newer VS if the cache had one
+        gen = chosen_gen or cached_gen or default_gen
+        if cached_gen and cached_gen != gen:
+            log(f"[INFO] Generator changed (was '{cached_gen}', now '{gen}'); clearing {build_dir}")
+            import shutil
+            shutil.rmtree(build_dir)
+            build_dir.mkdir(parents=True, exist_ok=True)
         args += ["-G", gen, "-A", "x64"]
         vcpkg = os.environ.get("VCPKG_INSTALLATION_ROOT")
         if vcpkg:
@@ -85,6 +126,7 @@ def main() -> int:
     parser.add_argument("--skip-deps", action="store_true", help="Reserved for future dependency installation")
     args = parser.parse_args()
 
+    load_root_env()
     plat = detect_platform()
     build_dir = BUILD_ROOT / plat
 
