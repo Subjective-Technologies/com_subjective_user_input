@@ -59,6 +59,28 @@ def cached_generator(build_dir: Path) -> str | None:
     return None
 
 
+def detect_vs_generator() -> str | None:
+    """Try to detect an installed Visual Studio generator via vswhere."""
+    vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    if not vswhere.exists():
+        return None
+    try:
+        result = subprocess.run(
+            [str(vswhere), "-latest", "-property", "catalog_productLineVersion"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        line = (result.stdout or "").strip()
+    except Exception:
+        return None
+    if line.startswith("18"):
+        return "Visual Studio 18 2026"
+    if line.startswith("17"):
+        return "Visual Studio 17 2022"
+    return None
+
+
 def detect_platform() -> str:
     sys_name = platform.system().lower()
     if "windows" in sys_name:
@@ -80,7 +102,8 @@ def configure(platform_name: str, cfg: str, generator: str | None) -> Path:
     args = ["cmake", "-S", str(ROOT), "-B", str(build_dir)]
 
     if platform_name == "windows":
-        default_gen = "Visual Studio 17 2022"
+        detected = detect_vs_generator()
+        default_gen = detected or "Visual Studio 17 2022"
         # Prefer a newer VS if the cache had one
         gen = chosen_gen or cached_gen or default_gen
         if cached_gen and cached_gen != gen:
