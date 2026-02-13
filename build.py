@@ -72,24 +72,23 @@ def cached_toolchain(build_dir: Path) -> Path | None:
 
 
 def detect_vs_generator() -> str | None:
-    """Try to detect an installed Visual Studio generator via vswhere."""
-    vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
-    if not vswhere.exists():
-        return None
+    """Pick a Visual Studio generator that CMake reports as available."""
     try:
         result = subprocess.run(
-            [str(vswhere), "-latest", "-property", "catalog_productLineVersion"],
+            ["cmake", "--help"],
             capture_output=True,
             text=True,
             check=True,
         )
-        line = (result.stdout or "").strip()
+        help_text = result.stdout or ""
     except Exception:
         return None
-    if line.startswith("18"):
-        return "Visual Studio 18 2026"
-    if line.startswith("17"):
+
+    # Prefer the stable generator used on GitHub-hosted runners.
+    if "Visual Studio 17 2022" in help_text:
         return "Visual Studio 17 2022"
+    if "Visual Studio 18 2026" in help_text:
+        return "Visual Studio 18 2026"
     return None
 
 
@@ -121,7 +120,6 @@ def configure(platform_name: str, cfg: str, generator: str | None) -> Path:
         gen = chosen_gen or cached_gen or default_gen
         if cached_gen and cached_gen != gen:
             log(f"[INFO] Generator changed (was '{cached_gen}', now '{gen}'); clearing {build_dir}")
-            import shutil
             shutil.rmtree(build_dir)
             build_dir.mkdir(parents=True, exist_ok=True)
             cached_tc = None
@@ -135,7 +133,6 @@ def configure(platform_name: str, cfg: str, generator: str | None) -> Path:
             toolchain = Path(vcpkg_root) / "scripts" / "buildsystems" / "vcpkg.cmake"
         if cached_tc and not cached_tc.exists():
             log(f"[WARN] Cached toolchain missing ({cached_tc}); clearing {build_dir}")
-            import shutil
             shutil.rmtree(build_dir)
             build_dir.mkdir(parents=True, exist_ok=True)
             cached_tc = None
