@@ -126,7 +126,15 @@ def configure(platform_name: str, cfg: str, generator: str | None) -> Path:
 
     cached_gen = cached_generator(build_dir)
     cached_tc = cached_toolchain(build_dir)
-    chosen_gen = generator or os.environ.get("CMAKE_GENERATOR") or cached_gen
+    env_gen = os.environ.get("CMAKE_GENERATOR")
+    if platform_name == "windows" and os.environ.get("GITHUB_ACTIONS") == "true":
+        # CI should not inherit local repo defaults like "Visual Studio 18 2026".
+        if env_gen:
+            log(f"[INFO] Ignoring CMAKE_GENERATOR='{env_gen}' on GitHub Actions.")
+        env_gen = None
+
+    # Prefer explicit override, then stable cache, then environment fallback.
+    chosen_gen = generator or cached_gen or env_gen
 
     args = ["cmake", "-S", str(ROOT), "-B", str(build_dir)]
 
