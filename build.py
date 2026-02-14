@@ -72,24 +72,37 @@ def cached_toolchain(build_dir: Path) -> Path | None:
 
 
 def detect_vs_generator() -> str | None:
-    """Pick a Visual Studio generator that CMake reports as available."""
-    try:
-        result = subprocess.run(
-            ["cmake", "--help"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        help_text = result.stdout or ""
-    except Exception:
-        return None
+    """Pick a Visual Studio generator based on installed instances."""
+    program_files_x86 = os.environ.get("ProgramFiles(x86)")
+    if program_files_x86:
+        vswhere = Path(program_files_x86) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+        if vswhere.exists():
+            try:
+                result = subprocess.run(
+                    [
+                        str(vswhere),
+                        "-latest",
+                        "-products",
+                        "*",
+                        "-requires",
+                        "Microsoft.Component.MSBuild",
+                        "-property",
+                        "installationVersion",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                version = (result.stdout or "").strip()
+                if version.startswith("17."):
+                    return "Visual Studio 17 2022"
+                if version.startswith("18."):
+                    return "Visual Studio 18 2026"
+            except Exception:
+                pass
 
-    # Prefer the stable generator used on GitHub-hosted runners.
-    if "Visual Studio 17 2022" in help_text:
-        return "Visual Studio 17 2022"
-    if "Visual Studio 18 2026" in help_text:
-        return "Visual Studio 18 2026"
-    return None
+    # Stable fallback for GitHub-hosted runners.
+    return "Visual Studio 17 2022"
 
 
 def detect_platform() -> str:
@@ -115,7 +128,7 @@ def configure(platform_name: str, cfg: str, generator: str | None) -> Path:
 
     if platform_name == "windows":
         detected = detect_vs_generator()
-        default_gen = detected or "Visual Studio 17 2022"
+        default_gen = detected or ("Ninja" if shutil.which("ninja") else "Visual Studio 17 2022")
         # Prefer a newer VS if the cache had one
         gen = chosen_gen or cached_gen or default_gen
         if cached_gen and cached_gen != gen:
@@ -123,7 +136,9 @@ def configure(platform_name: str, cfg: str, generator: str | None) -> Path:
             shutil.rmtree(build_dir)
             build_dir.mkdir(parents=True, exist_ok=True)
             cached_tc = None
-        args += ["-G", gen, "-A", "x64"]
+        args += ["-G", gen]
+        if gen.startswith("Visual Studio"):
+            args += ["-A", "x64"]
         vcpkg_root = os.environ.get("VCPKG_INSTALLATION_ROOT")
         toolchain_env = os.environ.get("VCPKG_TOOLCHAIN_FILE")
         toolchain = None
