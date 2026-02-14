@@ -152,12 +152,37 @@ def configure(platform_name: str, cfg: str, generator: str | None) -> Path:
         if gen.startswith("Visual Studio"):
             args += ["-A", "x64"]
         vcpkg_root = os.environ.get("VCPKG_INSTALLATION_ROOT")
+        vcpkg_root_env = os.environ.get("VCPKG_ROOT")
         toolchain_env = os.environ.get("VCPKG_TOOLCHAIN_FILE")
         toolchain = None
         if toolchain_env:
-            toolchain = Path(toolchain_env)
-        elif vcpkg_root:
-            toolchain = Path(vcpkg_root) / "scripts" / "buildsystems" / "vcpkg.cmake"
+            candidate = Path(toolchain_env)
+            if candidate.exists():
+                toolchain = candidate
+            else:
+                log(f"[WARN] VCPKG_TOOLCHAIN_FILE does not exist at {candidate}. Trying auto-detection.")
+        if toolchain is None:
+            roots: list[Path] = []
+            if vcpkg_root:
+                roots.append(Path(vcpkg_root))
+            if vcpkg_root_env:
+                roots.append(Path(vcpkg_root_env))
+            vcpkg_exe = shutil.which("vcpkg")
+            if vcpkg_exe:
+                roots.append(Path(vcpkg_exe).resolve().parent)
+            if os.environ.get("GITHUB_ACTIONS") == "true":
+                roots.append(Path("C:/vcpkg"))
+
+            seen: set[str] = set()
+            for root in roots:
+                key = str(root).lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidate = root / "scripts" / "buildsystems" / "vcpkg.cmake"
+                if candidate.exists():
+                    toolchain = candidate
+                    break
         if cached_tc and not cached_tc.exists():
             log(f"[WARN] Cached toolchain missing ({cached_tc}); clearing {build_dir}")
             shutil.rmtree(build_dir)
