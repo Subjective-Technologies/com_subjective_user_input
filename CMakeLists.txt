@@ -87,6 +87,14 @@ if(WIN32)
     target_link_libraries(input_unified PRIVATE ws2_32 user32)
 endif()
 
+if(APPLE)
+    # Required for CGEvent/CFRunLoop symbols used by macOS input capture/injection.
+    target_link_libraries(input_unified PRIVATE
+        "-framework ApplicationServices"
+        "-framework CoreFoundation"
+    )
+endif()
+
 # Copy .env to output directory (always runs during build)
 add_custom_target(copy_env ALL
     COMMAND ${CMAKE_COMMAND} -E copy_if_different

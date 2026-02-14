@@ -72,34 +72,38 @@ def cached_toolchain(build_dir: Path) -> Path | None:
 
 
 def detect_vs_generator() -> str | None:
-    """Pick a Visual Studio generator based on installed instances."""
+    """Pick a Visual Studio generator based on installed VC toolchains."""
     program_files_x86 = os.environ.get("ProgramFiles(x86)")
     if program_files_x86:
         vswhere = Path(program_files_x86) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
         if vswhere.exists():
-            try:
-                result = subprocess.run(
-                    [
-                        str(vswhere),
-                        "-latest",
-                        "-products",
-                        "*",
-                        "-requires",
-                        "Microsoft.Component.MSBuild",
-                        "-property",
-                        "installationVersion",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                )
-                version = (result.stdout or "").strip()
-                if version.startswith("17."):
-                    return "Visual Studio 17 2022"
-                if version.startswith("18."):
-                    return "Visual Studio 18 2026"
-            except Exception:
-                pass
+            candidates = [
+                ("[17.0,18.0)", "Visual Studio 17 2022"),
+                ("[18.0,19.0)", "Visual Studio 18 2026"),
+            ]
+            for version_range, generator in candidates:
+                try:
+                    result = subprocess.run(
+                        [
+                            str(vswhere),
+                            "-latest",
+                            "-products",
+                            "*",
+                            "-requires",
+                            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                            "-version",
+                            version_range,
+                            "-property",
+                            "installationPath",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                    )
+                    if (result.stdout or "").strip():
+                        return generator
+                except Exception:
+                    continue
 
     # Stable fallback for GitHub-hosted runners.
     return "Visual Studio 17 2022"
