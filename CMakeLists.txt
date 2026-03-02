@@ -9,14 +9,14 @@ set(SRC_FILES
     src/input_unified.c
 )
 
-add_executable(input_unified ${SRC_FILES})
+add_executable(com_subjective_user_input ${SRC_FILES})
 
 if(WIN32)
-    target_compile_definitions(input_unified PRIVATE WIN32)
+    target_compile_definitions(com_subjective_user_input PRIVATE WIN32)
 endif()
 
 if(MSVC)
-    target_compile_definitions(input_unified PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_definitions(com_subjective_user_input PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
 # Platform output folder
@@ -29,7 +29,7 @@ else()
 endif()
 
 set(OUTPUT_DIR "${CMAKE_SOURCE_DIR}/build/${PLATFORM_DIR}")
-set_target_properties(input_unified PROPERTIES
+set_target_properties(com_subjective_user_input PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${OUTPUT_DIR}"
     RUNTIME_OUTPUT_DIRECTORY_DEBUG "${OUTPUT_DIR}"
     RUNTIME_OUTPUT_DIRECTORY_RELEASE "${OUTPUT_DIR}"
@@ -42,7 +42,7 @@ if(DEFINED ENV{OPENSSL_ROOT_DIR} AND NOT DEFINED OPENSSL_ROOT_DIR)
 endif()
 
 find_package(OpenSSL REQUIRED)
-target_link_libraries(input_unified PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(com_subjective_user_input PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 
 # libwebsockets
 find_package(PkgConfig QUIET)
@@ -51,31 +51,31 @@ if(PkgConfig_FOUND)
 endif()
 
 if(LWS_FOUND)
-    target_include_directories(input_unified PRIVATE ${LWS_INCLUDE_DIRS})
-    target_link_directories(input_unified PRIVATE ${LWS_LIBRARY_DIRS})
-    target_link_libraries(input_unified PRIVATE ${LWS_LIBRARIES})
-    target_compile_options(input_unified PRIVATE ${LWS_CFLAGS_OTHER})
-    target_link_options(input_unified PRIVATE ${LWS_LDFLAGS_OTHER})
+    target_include_directories(com_subjective_user_input PRIVATE ${LWS_INCLUDE_DIRS})
+    target_link_directories(com_subjective_user_input PRIVATE ${LWS_LIBRARY_DIRS})
+    target_link_libraries(com_subjective_user_input PRIVATE ${LWS_LIBRARIES})
+    target_compile_options(com_subjective_user_input PRIVATE ${LWS_CFLAGS_OTHER})
+    target_link_options(com_subjective_user_input PRIVATE ${LWS_LDFLAGS_OTHER})
 else()
     find_package(libwebsockets CONFIG REQUIRED)
-    target_link_libraries(input_unified PRIVATE websockets_shared)
+    target_link_libraries(com_subjective_user_input PRIVATE websockets_shared)
 endif()
 
 if(UNIX AND NOT APPLE)
     find_package(Threads REQUIRED)
-    target_link_libraries(input_unified PRIVATE Threads::Threads m)
+    target_link_libraries(com_subjective_user_input PRIVATE Threads::Threads m)
     # X11 + extensions
     pkg_check_modules(X11 REQUIRED x11)
     pkg_check_modules(XTST REQUIRED xtst)
     pkg_check_modules(XRANDR REQUIRED xrandr)
     pkg_check_modules(XFIXES REQUIRED xfixes)
-    target_include_directories(input_unified PRIVATE
+    target_include_directories(com_subjective_user_input PRIVATE
         ${X11_INCLUDE_DIRS}
         ${XTST_INCLUDE_DIRS}
         ${XRANDR_INCLUDE_DIRS}
         ${XFIXES_INCLUDE_DIRS}
     )
-    target_link_libraries(input_unified PRIVATE
+    target_link_libraries(com_subjective_user_input PRIVATE
         ${X11_LIBRARIES}
         ${XTST_LIBRARIES}
         ${XRANDR_LIBRARIES}
@@ -84,12 +84,12 @@ if(UNIX AND NOT APPLE)
 endif()
 
 if(WIN32)
-    target_link_libraries(input_unified PRIVATE ws2_32 user32)
+    target_link_libraries(com_subjective_user_input PRIVATE ws2_32 user32)
 endif()
 
 if(APPLE)
     # Required for CGEvent/CFRunLoop symbols used by macOS input capture/injection.
-    target_link_libraries(input_unified PRIVATE
+    target_link_libraries(com_subjective_user_input PRIVATE
         "-framework ApplicationServices"
         "-framework CoreFoundation"
     )
@@ -102,4 +102,4 @@ add_custom_target(copy_env ALL
     COMMENT "Copying .env to build output"
     DEPENDS "${CMAKE_SOURCE_DIR}/.env"
 )
-add_dependencies(input_unified copy_env)
+add_dependencies(com_subjective_user_input copy_env)

@@ -1,9 +1,16 @@
 #!/bin/bash
-# Run the input_unified client
+# Run the com_subjective_user_input client
 # Usage: ./run.sh [arguments]
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BINARY="$SCRIPT_DIR/build/linux/input_unified"
+
+# Detect OS and set binary path
+case "$(uname -s)" in
+    Linux*)   BINARY="$SCRIPT_DIR/build/linux/com_subjective_user_input" ;;
+    Darwin*)  BINARY="$SCRIPT_DIR/build/macos/com_subjective_user_input" ;;
+    MINGW*|MSYS*|CYGWIN*) BINARY="$SCRIPT_DIR/build/windows/com_subjective_user_input.exe" ;;
+    *)        echo "Error: Unsupported OS: $(uname -s)"; exit 1 ;;
+esac
 
 if [ ! -f "$BINARY" ]; then
     echo "Error: Binary not found at $BINARY"

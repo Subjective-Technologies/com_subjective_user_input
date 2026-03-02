@@ -1,4 +1,4 @@
-# Makefile for input_unified.c - Cross-platform KVM Client
+# Makefile for com_subjective_user_input - Cross-platform KVM Client
 #
 # Build targets:
 #   make linux    - Build for Linux
@@ -23,7 +23,7 @@ DEFINES = -D_GNU_SOURCE
 # Output paths
 OUTDIR = build/$(PLATFORM)
 EXEEXT =
-TARGET = $(OUTDIR)/input_unified$(EXEEXT)
+TARGET = $(OUTDIR)/com_subjective_user_input$(EXEEXT)
 
 # Source files
 SRCS = src/input_unified.c
@@ -91,7 +91,7 @@ macos:
 	$(MAKE) PLATFORM=macos all
 
 clean:
-	rm -f build/linux/input_unified build/windows/input_unified.exe build/macos/input_unified input_unified.exe input_unified.o
+	rm -f build/linux/com_subjective_user_input build/windows/com_subjective_user_input.exe build/macos/com_subjective_user_input com_subjective_user_input.exe com_subjective_user_input.o
 	@echo "Cleaned build files"
 
 #==============================================================================
@@ -128,7 +128,7 @@ install-deps-windows:
 #==============================================================================
 
 help:
-	@echo "Makefile for input_unified.c - Cross-platform KVM Client"
+	@echo "Makefile for com_subjective_user_input - Cross-platform KVM Client"
 	@echo ""
 	@echo "Usage:"
 	@echo "  make              - Build for current platform"
@@ -142,7 +142,7 @@ help:
 	@echo "  make install-deps-macos  - Install macOS dependencies (brew)"
 	@echo ""
 	@echo "Running:"
-	@echo "  ./input_unified --help"
-	@echo "  ./input_unified --role main --server ws://192.168.1.100:8765"
-	@echo "  ./input_unified --role player --server ws://192.168.1.100:8765"
+	@echo "  ./com_subjective_user_input --help"
+	@echo "  ./com_subjective_user_input --role main --server ws://192.168.1.100:8765"
+	@echo "  ./com_subjective_user_input --role player --server ws://192.168.1.100:8765"
 
