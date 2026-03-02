@@ -170,6 +170,12 @@ def configure(platform_name: str, cfg: str, generator: str | None) -> Path:
             vcpkg_exe = shutil.which("vcpkg")
             if vcpkg_exe:
                 roots.append(Path(vcpkg_exe).resolve().parent)
+
+            # Common local install locations (docs default: C:\dev\vcpkg)
+            roots += [
+                Path("C:/dev/vcpkg"),
+                Path("C:/vcpkg"),
+            ]
             if os.environ.get("GITHUB_ACTIONS") == "true":
                 roots.append(Path("C:/vcpkg"))
 
@@ -209,7 +215,10 @@ def configure(platform_name: str, cfg: str, generator: str | None) -> Path:
             args += [f"-DOPENSSL_SSL_LIBRARY={openssl_ssl}"]
 
         if not toolchain and not (openssl_root or openssl_inc or openssl_crypto or openssl_ssl):
-            log("[ERROR] OpenSSL not found and no vcpkg toolchain set. Set OPENSSL_ROOT_DIR or install vcpkg and set VCPKG_INSTALLATION_ROOT/VCPKG_TOOLCHAIN_FILE.")
+            log(
+                "[ERROR] OpenSSL not found and no vcpkg toolchain set. Set OPENSSL_ROOT_DIR (or OPENSSL_INCLUDE_DIR/OPENSSL_SSL_LIBRARY/OPENSSL_CRYPTO_LIBRARY) "
+                "or install vcpkg and set VCPKG_INSTALLATION_ROOT/VCPKG_TOOLCHAIN_FILE (common path: C:\\dev\\vcpkg)."
+            )
             raise SystemExit(1)
         args += [
             f"-DCMAKE_RUNTIME_OUTPUT_DIRECTORY={build_dir / 'bin'}",
