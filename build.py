@@ -15,7 +15,9 @@ import sys
 import os
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+# Keep script root non-resolved so Windows CI can build through a short-path junction.
+ROOT = Path(__file__).absolute().parent
+REAL_ROOT = Path(__file__).resolve().parent
 BUILD_ROOT = ROOT / "build"
 
 
@@ -29,7 +31,7 @@ def run(cmd: list[str]) -> None:
 
 
 def load_root_env() -> None:
-    env_path = ROOT.parent.parent / ".env"
+    env_path = REAL_ROOT.parent.parent / ".env"
     if not env_path.exists():
         return
     loaded = 0
