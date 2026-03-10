@@ -85,6 +85,14 @@ endif()
 
 if(WIN32)
     target_link_libraries(com_subjective_user_input PRIVATE ws2_32 user32)
+    # The source uses #pragma comment(lib, "pthreadVC3.lib") which requires
+    # the vcpkg lib directory on the linker search path.
+    if(VCPKG_INSTALLED_DIR AND VCPKG_TARGET_TRIPLET)
+        target_link_directories(com_subjective_user_input PRIVATE
+            "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/lib"
+            "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/debug/lib"
+        )
+    endif()
 endif()
 
 if(APPLE)
