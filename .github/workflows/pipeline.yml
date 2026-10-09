@@ -1,0 +1,29 @@
+# Pipeline for com_subjective_user_input.
+# Runs on every push to main, on pull requests, and by hand (Actions -> Pipeline -> Run workflow).
+# Status of every project's last run: dashboard -> ST Backend -> Pipelines.
+name: Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
