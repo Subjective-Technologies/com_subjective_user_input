@@ -23,6 +23,8 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
+      - name: System libraries
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq pkg-config libssl-dev libwebsockets-dev libx11-dev libxtst-dev libxrandr-dev libxfixes-dev
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - name: Build
