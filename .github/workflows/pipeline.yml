@@ -1,5 +1,6 @@
 # Pipeline for com_subjective_user_input.
 # Runs on every push to main, on pull requests, and by hand (Actions -> Pipeline -> Run workflow).
+# A push to main (or a manual run on main) also publishes a GitHub release.
 # Status of every project's last run: dashboard -> ST Backend -> Pipelines.
 name: Pipeline
 
@@ -11,7 +12,9 @@ on:
 
 concurrency:
   group: pipeline-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseded pull-request runs are cancelled; a run on main never is, so a deploy
+  # is not cut off halfway.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -29,3 +32,58 @@ jobs:
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - name: Build
         run: cmake --build build -j"$(nproc)"
+
+  deploy:
+    name: Deploy
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # One deploy at a time, and a newer push never cancels a deploy halfway.
+    concurrency:
+      group: deploy-com_subjective_user_input
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: System libraries
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq pkg-config libssl-dev libwebsockets-dev libx11-dev libxtst-dev libxrandr-dev libxfixes-dev
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+      - name: Package binaries
+        run: |
+          mkdir -p release-assets
+          name="${GITHUB_REPOSITORY#*/}"
+          find build -maxdepth 3 -type f -perm -u+x ! -name '*.so*' ! -path '*/CMakeFiles/*' -print > binaries.txt
+          cat binaries.txt
+          tar -czf "release-assets/$name-linux-x86_64-${GITHUB_SHA::12}.tar.gz" -T binaries.txt
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/$GITHUB_REPOSITORY"
+          auth="Authorization: Bearer $GH_TOKEN"
+          if [ -n "${VERSION:-}" ]; then
+            TAG="v$VERSION"
+            if curl -fsS -o /dev/null -H "$auth" "$api/git/ref/tags/$TAG"; then
+              echo "::notice::$TAG is already released. Bump the version to publish a new release."
+              exit 0
+            fi
+          else
+            TAG="build-$(date -u +%Y_%m_%d_%H_%M_%S)"
+          fi
+          export TAG
+          payload=$(python3 -c 'import json,os; t=os.environ["TAG"]; print(json.dumps({"tag_name":t,"target_commitish":os.environ["GITHUB_SHA"],"name":t,"generate_release_notes":True}))')
+          release_id=$(curl -fsS -H "$auth" -H "Accept: application/vnd.github+json" -X POST "$api/releases" -d "$payload" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+          for asset in release-assets/*; do
+            [ -f "$asset" ] || continue
+            curl -fsS -o /dev/null -H "$auth" -H "Content-Type: application/octet-stream" \
+              --data-binary @"$asset" \
+              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets?name=$(basename "$asset")"
+            echo "Uploaded $(basename "$asset")"
+          done
+          echo "Released $TAG at $GITHUB_SHA"
